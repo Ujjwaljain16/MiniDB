@@ -122,37 +122,40 @@ export class Page {
     return data;
   }
 
-  compact(): Map<SlotId, SlotId> {
-    const remapping = new Map<SlotId, SlotId>();
+  compact(): void {
+    const nSlots = this.numSlots;
+    let newNumSlots = nSlots;
+    
+    // Trim trailing tombstones to reclaim slot directory space
+    for (let i = nSlots - 1; i >= 0; i--) {
+      const slotOffset = PAGE_HEADER_SIZE + i * SLOT_ENTRY_SIZE;
+      if (this.buf.readUInt16LE(slotOffset) !== SLOT_TOMBSTONE) {
+        break;
+      }
+      newNumSlots--;
+    }
+
     const tempBuf = Buffer.alloc(PAGE_SIZE);
-    this.buf.copy(tempBuf, 0, 0, PAGE_HEADER_SIZE);
+    // Copy the header and the active slot directory
+    this.buf.copy(tempBuf, 0, 0, PAGE_HEADER_SIZE + newNumSlots * SLOT_ENTRY_SIZE);
     
     let currentDataOffset = PAGE_SIZE;
-    let newSlotIdx = 0;
-    const nSlots = this.numSlots;
 
-    for (let i = 0; i < nSlots; i++) {
+    for (let i = 0; i < newNumSlots; i++) {
       const slotOffset = PAGE_HEADER_SIZE + i * SLOT_ENTRY_SIZE;
       const dataOffset = this.buf.readUInt16LE(slotOffset);
-      const dataLen = this.buf.readUInt16LE(slotOffset + 2);
       
       if (dataOffset !== SLOT_TOMBSTONE) {
-        remapping.set(i as SlotId, newSlotIdx as SlotId);
+        const dataLen = this.buf.readUInt16LE(slotOffset + 2);
         currentDataOffset -= dataLen;
+        
         this.buf.copy(tempBuf, currentDataOffset, dataOffset, dataOffset + dataLen);
-        
-        const newSlotOffset = PAGE_HEADER_SIZE + newSlotIdx * SLOT_ENTRY_SIZE;
-        tempBuf.writeUInt16LE(currentDataOffset, newSlotOffset);
-        tempBuf.writeUInt16LE(dataLen, newSlotOffset + 2);
-        
-        newSlotIdx++;
+        tempBuf.writeUInt16LE(currentDataOffset, slotOffset);
       }
     }
     
-    tempBuf.writeUInt16LE(newSlotIdx, 4); // update numSlots
+    tempBuf.writeUInt16LE(newNumSlots, 4); // update numSlots
     tempBuf.writeUInt16LE(currentDataOffset, 6); // update freeSpacePtr
     tempBuf.copy(this.buf, 0, 0, PAGE_SIZE);
-    
-    return remapping;
   }
 }

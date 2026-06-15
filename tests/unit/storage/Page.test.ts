@@ -82,20 +82,20 @@ describe('Page', () => {
 
     const initialFree = page.freeSpace();
     
-    const remapping = page.compact();
+    page.compact();
     
     // AAA stays at slot 0
-    expect(remapping.get(0 as SlotId)).toBe(0);
-    // CCC moves from slot 2 to slot 1
-    expect(remapping.get(2 as SlotId)).toBe(1);
-    // BBB was deleted, should not be in remapping
-    expect(remapping.has(1 as SlotId)).toBe(false);
-
-    expect(page.numSlots).toBe(2);
-    // Free space should increase by the deleted record size (3 bytes) + deleted slot entry (4 bytes)
-    expect(page.freeSpace()).toBe(initialFree + 3 + 4);
-
     expect(page.getRecord(0 as SlotId)!.toString()).toBe('AAA');
-    expect(page.getRecord(1 as SlotId)!.toString()).toBe('CCC');
+    
+    // BBB was deleted
+    expect(page.getRecord(1 as SlotId)).toBeNull();
+    
+    // CCC stays at slot 2
+    expect(page.getRecord(2 as SlotId)!.toString()).toBe('CCC');
+
+    expect(page.numSlots).toBe(3); // numSlots doesn't shrink because slot 2 is still active
+    // Free space should increase by the deleted record size (3 bytes)
+    // The slot entry is NOT reclaimed because slot 2 exists
+    expect(page.freeSpace()).toBe(initialFree + 3);
   });
 });

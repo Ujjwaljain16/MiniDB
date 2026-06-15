@@ -106,4 +106,53 @@ describe('BufferPool', () => {
     // p0 was dirty with LSN 42, log manager should have been flushed to 42
     expect(lm.flushedLsn).toBe(42 as LSN);
   });
+
+  it('torture test: 10000 operations on 100 pages with pool size 3', async () => {
+    const NUM_PAGES = 100;
+    const OPERATIONS = 10000;
+    const pageIds: PageId[] = [];
+
+    // Create 100 pages
+    for (let i = 0; i < NUM_PAGES; i++) {
+      const [pid, buf] = await pool.newPage();
+      pageIds.push(pid);
+      
+      // Write some initial data to each page (e.g. its own ID)
+      buf.writeInt32LE(pid, 0);
+      pool.unpinPage(pid, true); // initial write makes it dirty
+    }
+
+    // Now perform 10000 random reads/writes
+    let successfulOps = 0;
+    for (let i = 0; i < OPERATIONS; i++) {
+      const targetPid = pageIds[Math.floor(Math.random() * NUM_PAGES)]!;
+      const isWrite = Math.random() < 0.2; // 20% writes
+
+      const buf = await pool.fetchPage(targetPid);
+      
+      // Verify data integrity (it should hold its own ID)
+      const readVal = buf.readInt32LE(0);
+      if (readVal !== targetPid) {
+        throw new Error(`Data corruption! Expected ${targetPid}, got ${readVal}`);
+      }
+
+      if (isWrite) {
+        // Redundant write, but marks dirty
+        buf.writeInt32LE(targetPid, 0);
+      }
+
+      pool.unpinPage(targetPid, isWrite);
+      successfulOps++;
+    }
+
+    expect(successfulOps).toBe(OPERATIONS);
+    
+    // Test passes if no "all frames are pinned" exception occurred
+    // and no data corruption was found (dirty pages were correctly flushed and reloaded)
+    
+    // Final stats check
+    const stats = pool.stats();
+    expect(stats.hits + stats.misses).toBe(OPERATIONS);
+    expect(stats.evictions).toBeGreaterThan(0);
+  });
 });

@@ -573,4 +573,103 @@ export class BPlusTree implements IBPlusTree {
     
     this._rootPageId = currentLevel[0]!.pageId;
   }
+
+  async debugValidate(): Promise<void> {
+    if (this._rootPageId === NULL_PAGE_ID) return;
+
+    let leafDepth = -1;
+
+    const dfs = async (pageId: PageId, depth: number, parentId: PageId, minKey: ColValue | null, maxKey: ColValue | null): Promise<void> => {
+      const node = await this.fetchNode(pageId);
+      
+      try {
+        // 1. Parent pointer
+        if (node.parentPageId !== parentId) {
+          throw new Error(`Parent pointer mismatch at page ${pageId}: expected ${parentId}, got ${node.parentPageId}`);
+        }
+
+        // 2. Occupancy (except root)
+        if (pageId !== this._rootPageId) {
+          const minKeys = Math.ceil((node.maxKeys - 1) / 2);
+          if (node.numKeys < minKeys || node.numKeys > node.maxKeys) {
+            throw new Error(`Occupancy violation at page ${pageId}: numKeys=${node.numKeys}, min=${minKeys}, max=${node.maxKeys}`);
+          }
+        }
+
+        if (node.isLeaf) {
+          // Leaf checks
+          if (leafDepth === -1) {
+            leafDepth = depth;
+          } else if (leafDepth !== depth) {
+            throw new Error(`Height inconsistency: leaf at depth ${depth}, expected ${leafDepth}`);
+          }
+
+          // Order and bounds
+          for (let i = 0; i < node.numKeys; i++) {
+            const k = node.getLeafEntry(i).key;
+            if (i > 0 && compareKeys(node.getLeafEntry(i - 1).key, k, this.colDef) >= 0) {
+              throw new Error(`Leaf keys not strictly sorted at page ${pageId}`);
+            }
+            if (minKey !== null && compareKeys(k, minKey, this.colDef) < 0) {
+              throw new Error(`Leaf key ${k} < min bound ${minKey} at page ${pageId}`);
+            }
+            if (maxKey !== null && compareKeys(k, maxKey, this.colDef) >= 0) {
+              throw new Error(`Leaf key ${k} >= max bound ${maxKey} at page ${pageId}`);
+            }
+          }
+        } else {
+          // Internal checks
+          if (node.numKeys === 0 && pageId !== this._rootPageId) {
+            throw new Error(`Internal node ${pageId} has 0 keys (not root)`);
+          }
+
+          for (let i = 0; i < node.numKeys; i++) {
+            const k = node.getInternalKey(i);
+            if (i > 0 && compareKeys(node.getInternalKey(i - 1), k, this.colDef) >= 0) {
+              throw new Error(`Internal keys not strictly sorted at page ${pageId}`);
+            }
+          }
+
+          for (let i = 0; i <= node.numKeys; i++) {
+            const childId = node.getChildId(i);
+            const nextMin = i === 0 ? minKey : node.getInternalKey(i - 1);
+            const nextMax = i === node.numKeys ? maxKey : node.getInternalKey(i);
+            
+            await dfs(childId, depth + 1, pageId, nextMin, nextMax);
+          }
+        }
+      } finally {
+        this.bufferPool.unpinPage(pageId, false);
+      }
+    };
+
+    await dfs(this._rootPageId, 0, NULL_PAGE_ID, null, null);
+
+    // Check leaf chain
+    let curr = this._rootPageId;
+    while (true) {
+      const node = await this.fetchNode(curr);
+      const isLeaf = node.isLeaf;
+      const child0 = isLeaf ? NULL_PAGE_ID : node.getChildId(0);
+      this.bufferPool.unpinPage(curr, false);
+      if (isLeaf) break;
+      curr = child0;
+    }
+
+    while (curr !== NULL_PAGE_ID) {
+      const node = await this.fetchNode(curr);
+      const nextId = node.nextLeafId;
+      this.bufferPool.unpinPage(curr, false);
+      
+      if (nextId !== NULL_PAGE_ID) {
+        const nextNode = await this.fetchNode(nextId);
+        if (!nextNode.isLeaf) {
+          this.bufferPool.unpinPage(nextId, false);
+          throw new Error(`Next leaf pointer points to internal node ${nextId}`);
+        }
+        this.bufferPool.unpinPage(nextId, false);
+      }
+      curr = nextId;
+    }
+  }
 }

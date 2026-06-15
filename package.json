@@ -1,0 +1,25 @@
+{
+  "name": "minidb",
+  "version": "0.1.0",
+  "description": "MiniDB — a from-scratch relational database engine in TypeScript",
+  "engines": { "node": ">=20" },
+  "type": "module",
+  "scripts": {
+    "dev":   "node --import tsx src/shell/REPL.ts",
+    "test":  "jest --config jest.config.cjs",
+    "bench": "node --import tsx tests/benchmarks/run_all.ts",
+    "build": "tsc",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "sql-parser-cst": "^0.23.0"
+  },
+  "devDependencies": {
+    "typescript":      "^5.4.5",
+    "@types/node":     "^20.14.0",
+    "tsx":             "^4.15.5",
+    "jest":            "^29.7.0",
+    "ts-jest":         "^29.1.4",
+    "@types/jest":     "^29.5.12"
+  }
+}

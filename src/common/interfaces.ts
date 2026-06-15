@@ -258,27 +258,21 @@ export interface ICatalog {
  * boundaries with ts-jest, esbuild, and isolatedModules builds.
  */
 export enum LockMode {
-  IS = 0, // Intention Shared  — intend to acquire S locks on rows below
-  IX = 1, // Intention Exclusive — intend to acquire X locks on rows below
-  S  = 2, // Shared — read lock on the resource
-  X  = 3, // Exclusive — write lock on the resource
+  S  = 0, // Shared — read lock on the resource
+  X  = 1, // Exclusive — write lock on the resource
 }
 
 /**
  * Lock compatibility matrix.
  * `LOCK_COMPAT[grantedMode][requestedMode] === true` means compatible (no conflict).
  *
- *          IS   IX    S    X
- * IS     [  ✓    ✓    ✓    ✗ ]
- * IX     [  ✓    ✓    ✗    ✗ ]
- * S      [  ✓    ✗    ✓    ✗ ]
- * X      [  ✗    ✗    ✗    ✗ ]
+ *          S    X
+ * S      [  ✓    ✗ ]
+ * X      [  ✗    ✗ ]
  */
 export const LOCK_COMPAT: ReadonlyArray<ReadonlyArray<boolean>> = [
-  /* IS */ [true,  true,  true,  false],
-  /* IX */ [true,  true,  false, false],
-  /* S  */ [true,  false, true,  false],
-  /* X  */ [false, false, false, false],
+  /* S  */ [true,  false],
+  /* X  */ [false, false],
 ] as const;
 
 /**
@@ -287,6 +281,7 @@ export const LOCK_COMPAT: ReadonlyArray<ReadonlyArray<boolean>> = [
  */
 export enum TxnState {
   GROWING   = 'GROWING',    // can acquire locks; this is the only state we allow new acquisitions
+  WAITING   = 'WAITING',    // blocked waiting for a lock
   COMMITTED = 'COMMITTED',
   ABORTED   = 'ABORTED',
 }
@@ -312,14 +307,6 @@ export interface Transaction {
  * releaseAll() MUST be called only at commit or abort — not mid-transaction.
  */
 export interface ILockManager {
-  /**
-   * Acquire an intention lock on a table.
-   * Typically called before acquiring row-level locks:
-   *   read → IS table lock + S row lock
-   *   write → IX table lock + X row lock
-   */
-  acquireTableLock(txnId: TxnId, tableId: TableId, mode: LockMode): Promise<void>;
-
   /**
    * Acquire a lock on a specific row (RID).
    * Blocks until compatible with all currently granted locks on that row.

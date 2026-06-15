@@ -16,3 +16,17 @@ export class LogManager implements ILogManager {
   currentLsn(): LSN { return this._currentLsn; }
   close(): Promise<void> { throw new Error('NYI'); }
 }
+
+export class NullLogManager implements ILogManager {
+  async append(_record: Omit<LogRecord, 'lsn'>): Promise<LSN> {
+    return INVALID_LSN;
+  }
+
+  async flush(_upToLsn: LSN): Promise<void> {
+    // No-op
+  }
+  
+  async *iterator(_fromLsn: LSN): AsyncIterableIterator<LogRecord> {}
+  currentLsn(): LSN { return INVALID_LSN; }
+  async close(): Promise<void> {}
+}

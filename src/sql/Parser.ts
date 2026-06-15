@@ -70,9 +70,10 @@ function transformStatement(stmt: CstNode): Statement {
     case 'commit_stmt': return { kind: 'commit' };
     case 'rollback_stmt': return { kind: 'abort' };
     case 'explain_stmt': return transformExplain(stmt);
-    // Analyze and Show are not native to sqlite CST, they might parse as arbitrary or we can intercept them
+    case 'analyze_stmt': return transformAnalyze(stmt);
+    // Show is not native to sqlite CST, they might parse as arbitrary or we can intercept them
     default:
-      // Try custom parsing for ANALYZE / SHOW if sql-parser-cst doesn't support them well
+      // Try custom parsing for SHOW if sql-parser-cst doesn't support them well
       throw new Error(`Unsupported statement type: ${stmt.type}`);
   }
 }
@@ -285,6 +286,19 @@ function transformExplain(stmt: CstNode): ExplainStmt {
     kind: 'explain',
     analyze,
     stmt: transformStatement(innerStmt!)
+  };
+}
+
+function transformAnalyze(stmt: CstNode): AnalyzeStmt {
+  let table: string;
+  if (stmt.tables && stmt.tables.items && stmt.tables.items.length > 0) {
+    table = (stmt.tables.items[0]! as CstNode).name as string;
+  } else {
+    throw new Error('ANALYZE must specify a table');
+  }
+  return {
+    kind: 'analyze',
+    table
   };
 }
 

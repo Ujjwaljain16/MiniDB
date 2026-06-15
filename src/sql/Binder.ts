@@ -48,7 +48,7 @@ export class Binder {
     // 1. Bind FROM
     const primaryEntry = this.getTable(stmt.from.table);
     const primaryRefName = stmt.from.alias || stmt.from.table;
-    const scopeTableVal = { entry: primaryEntry } as any;
+    const scopeTableVal: { entry: CatalogEntry; alias?: string } = { entry: primaryEntry };
     if (stmt.from.alias) scopeTableVal.alias = stmt.from.alias;
     scope.tables.set(primaryRefName, scopeTableVal);
     
@@ -67,7 +67,7 @@ export class Binder {
       if (scope.tables.has(joinRefName)) {
         throw new BindError(`Table name or alias '${joinRefName}' is defined multiple times`);
       }
-      const scopeJoinVal = { entry: joinEntry } as any;
+      const scopeJoinVal: { entry: CatalogEntry; alias?: string } = { entry: joinEntry };
       if (join.alias) scopeJoinVal.alias = join.alias;
       scope.tables.set(joinRefName, scopeJoinVal);
       
@@ -231,10 +231,8 @@ export class Binder {
           kind: 'bound_binary',
           op: expr.op,
           left,
-          right,
-          // Comparison always yields BOOL
-          alias: undefined
-        } as any; // Return type has BOOL but interface doesn't explicitly store return type of expression node unless we add it
+          right
+        };
         // Wait, our BoundExpression doesn't have `type` field on all nodes, only bound_col and bound_literal
         // I will just return it. 
         
@@ -246,7 +244,7 @@ export class Binder {
           op: expr.op,
           left: lLeft,
           right: lRight
-        } as any;
+        };
     }
   }
 
@@ -288,15 +286,15 @@ export class Binder {
   private getTable(tableName: string): CatalogEntry {
     try {
       return this.catalog.getTable(tableName as TableId);
-    } catch (e: any) {
-      if (e.message.includes('NotFoundError')) {
+    } catch (e: unknown) {
+      if (e instanceof Error && e.message.includes('NotFoundError')) {
         throw new BindError(`Table '${tableName}' not found`);
       }
       throw e;
     }
   }
 
-  private inferLiteralType(val: any): string {
+  private inferLiteralType(val: unknown): string {
     if (typeof val === 'number') return Number.isInteger(val) ? 'INT' : 'FLOAT';
     if (typeof val === 'string') return 'VARCHAR';
     if (typeof val === 'boolean') return 'BOOL';

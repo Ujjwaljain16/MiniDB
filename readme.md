@@ -2,6 +2,8 @@
 
 Welcome to the root repository for the MiniDB Capstone Project. 
 
+![MiniDB E2E Demo](demodb.gif)
+
 In accordance with the Advanced DBMS course guidelines, the core database engine codebase, documentation, and benchmark suites have been encapsulated within a dedicated team directory.
 
 ## 🚀 Access the Project

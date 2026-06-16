@@ -1,26 +1,3 @@
-Yes. This is exactly the kind of document you should have for viva. But I would make it **much more than a static architecture document**.
-
-The README is "what MiniDB is".
-
-This document should be:
-
-> **"The Story of Building MiniDB: Architecture, Evolution, Engineering Decisions, Bugs, Tradeoffs, and Lessons Learned."**
-
-A viva panel does not only ask "what is a B+ Tree?" They ask:
-
-* Why did you choose this design?
-* What went wrong while building it?
-* How did you debug it?
-* What are the limitations?
-* What would PostgreSQL do differently?
-* How did your architecture evolve?
-
-Given the journey we had (root persistence bug, page header corruption, ANALYZE statistics bug, index backfill issue, Heap/B+Tree interleaving issue, WAL undo bug, vectorization bottlenecks, benchmark stabilization, etc.), this document should capture all of that.
-
-It will be very large (likely 30,000+ words), so I will split it into parts.
-
----
-
 # MiniDB: Engineering Journey, Architecture & Viva Defense Guide
 
 ## Preface: Why MiniDB Exists
@@ -386,23 +363,7 @@ Production engines often use RAII-style guards to guarantee pages are always rel
 
 ---
 
-**End of Part 1**
-
-Next parts will cover:
-
-* **Part 2:** B+ Tree indexing journey, root persistence bug, splits/merges, catalog synchronization, and index benchmarks.
-* **Part 3:** SQL layer, optimizer, statistics, ANALYZE evolution, and why the optimizer initially failed to choose indexes.
-* **Part 4:** Volcano execution, vectorized execution, performance bottlenecks, and benchmark evolution.
-* **Part 5:** Transactions, deadlocks, Strict 2PL design decisions.
-* **Part 6:** WAL, ARIES recovery, terrifying recovery bugs, crash testing, and production audit.
-* **Part 7:** Final architecture decisions, limitations, viva questions, and engineering lessons.
-
-This will become the definitive "how MiniDB was actually built" document, not just a README.
-# MiniDB Engineering Journey, Architecture & Viva Defense Guide
-
-# Part 2 — B+ Tree Indexing: From Linear Scans to Logarithmic Search
-
----
+# B+ Tree Indexing: From Linear Scans to Logarithmic Search
 
 # Chapter 2: Why We Needed an Index
 
@@ -1229,30 +1190,7 @@ A B+ Tree that works in memory is easy.
 A B+ Tree that survives crashes, restarts, splits, and millions of operations is what turns it into a real database component.
 
 ---
-
-# End of Part 2
-
-Next:
-
-## Part 3 — SQL Layer, Binder, Query Planning, Cost-Based Optimization, and the Bugs That Prevented Index Selection
-
-We will cover:
-
-* How raw SQL becomes executable operators
-* Building the AST using discriminated unions
-* The Binder and semantic validation
-* Logical vs Physical plans
-* Cost model design
-* `ANALYZE` statistics
-* Why the optimizer initially always chose `SeqScan`
-* The missing column statistics bug
-* The `CREATE INDEX` backfill limitation
-* The final 100,000-row optimizer victory where `phys_index_scan` was chosen automatically
-# MiniDB Engineering Journey, Architecture & Viva Defense Guide
-
-# Part 3 — SQL Layer, Query Planning & Cost-Based Optimization
-
----
+# SQL Layer, Query Planning & Cost-Based Optimization
 
 # Chapter 3: The Journey from SQL Text to an Executable Query
 
@@ -2194,29 +2132,7 @@ The quality of a database optimizer is directly tied to the quality of its stati
 
 ---
 
-# End of Part 3
-
-Next:
-
-# Part 4 — Execution Engine Evolution: Volcano Model, Vectorized Engine, Performance Bottlenecks, Benchmark Journey, and the Engineering Decisions Behind a 2x Speedup
-
-Topics covered next:
-
-* Why the Volcano model became a bottleneck
-* `open()`, `next()`, `close()` operator lifecycle
-* SeqScan, IndexScan, Filter, Join, Insert, Delete operators
-* Integration with Lock Manager and WAL
-* The RID propagation design evolution (`__rid__` hack → `TupleSlot`)
-* Vectorized execution design
-* DataChunk layout
-* The async bottleneck that destroyed early vectorization performance
-* Direct page decoding optimization
-* Why strict 2PL reduced vectorization gains
-* Real benchmark analysis and Amdahl's Law
-
-# MiniDB Engineering Journey, Architecture & Viva Defense Guide
-
-# Part 4 — Execution Engine Evolution: Volcano Model, Vectorization, Performance Bottlenecks & Engineering Decisions
+# Execution Engine Evolution: Volcano Model, Vectorization, Performance Bottlenecks & Engineering Decisions
 
 ---
 
@@ -3024,22 +2940,1891 @@ which benefits from:
 
 ---
 
-# End of Part 4
+# Vectorized Engine Evolution, Performance Debugging Journey, Benchmarks & Engineering Lessons
 
-Next:
+---
 
-# Part 5 — Vectorized Engine Evolution, Performance Debugging Journey, Benchmarks, LRU-K, Buffer Pool Benchmarks, and the Real Engineering Lessons
+# Chapter 5: The Performance Journey — From Theory to Reality
 
-Topics covered next:
+By the end of Phase 7, MiniDB was already a complete relational database engine:
 
-* The first failed vectorized implementation and why it was slow
-* Async iterator bottleneck discovered during benchmarking
-* Direct 4KB page decoding optimization
-* Eliminating tuple allocations
-* Branchless `selectionVector` filtering
-* Why Strict 2PL limited speedups (Amdahl’s Law)
-* B+ Tree vs SeqScan benchmark journey
-* Cache warmup benchmarks
-* LRU vs LRU-K analysis
-* Final performance numbers and viva defense answers
+* Heap Storage
+* B+ Tree indexing
+* Cost-Based Optimizer
+* Volcano execution
+* Strict 2PL transactions
+* ARIES-lite recovery
 
+Functionally, the system was complete.
+
+However, modern analytical databases such as DuckDB, Vectorwise, and modern PostgreSQL extensions have demonstrated that **how queries are executed can be just as important as what algorithm is used**.
+
+A theoretically optimal query plan can still waste enormous CPU time due to execution overhead.
+
+This became the motivation for our extension track:
+
+> **Track A: High-Performance Vectorized Query Execution**
+
+---
+
+# 1. The Original Hypothesis
+
+The classical Volcano model executes:
+
+```
+next()
+   |
+returns 1 tuple
+   |
+next()
+   |
+returns 1 tuple
+```
+
+For a scan over 1 million rows:
+
+```
+1,000,000 next() calls
+```
+
+Each call introduces:
+
+* Function call overhead
+* Promise scheduling overhead
+* JavaScript object allocations
+* Tuple array creation
+* Poor CPU cache locality
+
+The CPU spends a significant amount of time managing execution machinery rather than evaluating the actual query.
+
+---
+
+# The Goal of Vectorization
+
+Instead of:
+
+```
+Row 1:
+[1, Alice, 20]
+
+Row 2:
+[2, Bob, 30]
+
+Row 3:
+[3, Carol, 40]
+```
+
+Process:
+
+```
+Batch of 1024 rows
+
+
+ID:
+[1,2,3,4,...]
+
+
+AGE:
+[20,30,40,50,...]
+
+
+NAME:
+AliceBobCarol...
+```
+
+The database now performs:
+
+```
+for i = 0 to 1024:
+    age[i] > 18
+```
+
+instead of:
+
+```
+get next tuple
+extract column
+compare value
+return tuple
+repeat
+```
+
+The CPU can optimize this pattern far better.
+
+---
+
+# 2. DataChunk Design
+
+The foundation of vectorization is the `DataChunk`.
+
+A DataChunk represents a fixed-size batch:
+
+```
+BATCH_SIZE = 1024 rows
+```
+
+---
+
+## Primitive Column Storage
+
+Numeric values are stored using TypedArrays:
+
+```
+INT       -> Int32Array
+BIGINT    -> BigInt64Array
+FLOAT     -> Float64Array
+BOOLEAN   -> Uint8Array
+```
+
+This gives:
+
+* Contiguous memory layout
+* Minimal allocation overhead
+* Better CPU cache utilization
+
+---
+
+## NULL Handling
+
+A major design decision was:
+
+> How do we represent NULL values when TypedArrays cannot store null?
+
+Our solution:
+
+```
+nullBitmap per column
+```
+
+Example:
+
+```
+Age Values:
+
+[25, 0, 40, 0]
+
+
+NULL Bitmap:
+
+[0, 1, 0, 1]
+```
+
+Meaning:
+
+```
+25
+NULL
+40
+NULL
+```
+
+This avoids:
+
+* JavaScript boxed objects
+* Expensive nullable wrappers
+* Branch-heavy null checks
+
+---
+
+## VARCHAR Storage
+
+Strings are more complex.
+
+A naive design:
+
+```
+string[]
+```
+
+would create thousands of JavaScript objects.
+
+Instead we adopted a columnar string buffer:
+
+```
+Offsets:
+[0, 5, 8]
+
+
+Data Buffer:
+
+AliceBobTom
+```
+
+The lookup:
+
+```
+Row 0:
+start = 0
+end = 5
+
+=> Alice
+```
+
+This approach is similar to Apache Arrow and modern column stores.
+
+---
+
+# 3. Vectorized Operator Architecture
+
+A new execution interface was introduced:
+
+```typescript
+interface IVecOperator {
+    open(): Promise<void>;
+    nextBatch(): Promise<DataChunk | null>;
+    close(): Promise<void>;
+}
+```
+
+The pipeline became:
+
+```
+VecProject
+      |
+VecFilter
+      |
+VecSeqScan
+```
+
+instead of:
+
+```
+Project
+   |
+Filter
+   |
+SeqScan
+```
+
+---
+
+# 4. The First Implementation Failure
+
+Initially, we expected large speedups.
+
+The first implementation simply wrapped the existing heap iterator:
+
+```
+HeapFile.scan()
+      |
+await next()
+      |
+create tuple
+      |
+copy into DataChunk
+```
+
+Conceptually it was vectorized.
+
+In reality, it was not.
+
+---
+
+## Hidden Bottleneck: Async Iterator Overhead
+
+Every tuple required:
+
+```
+await iterator.next()
+```
+
+For:
+
+```
+1,000,000 rows
+```
+
+we still executed:
+
+```
+1,000,000 await operations
+```
+
+The event loop overhead completely destroyed the expected gains.
+
+This was a major engineering lesson:
+
+> Simply batching the API does not mean the internal execution is vectorized.
+
+---
+
+# 5. Major Optimization: Direct Page Decoding
+
+The solution was to bypass tuple-level iteration.
+
+Instead of:
+
+```
+Disk Page
+    |
+Deserialize Tuple
+    |
+Create JavaScript Array
+    |
+Copy into DataChunk
+```
+
+we changed the path to:
+
+```
+Disk Page
+    |
+Read raw bytes
+    |
+Decode directly
+    |
+Write into TypedArray columns
+```
+
+---
+
+## Before
+
+```
+Page
+
+ |
+Tuple Object
+
+ |
+[1, "Alice", 20]
+
+ |
+DataChunk
+```
+
+Multiple allocations occurred for every row.
+
+---
+
+## After
+
+```
+Page Buffer
+
+        |
+
+Column Arrays
+
+ID:
+[1,2,3]
+
+AGE:
+[20,30,40]
+```
+
+Zero intermediate tuple objects.
+
+---
+
+# Result
+
+Benefits:
+
+* Fewer garbage collections
+* Lower memory pressure
+* Better cache locality
+* Much tighter CPU loops
+
+---
+
+# 6. Optimizing VecFilter
+
+The first filter looked like:
+
+```typescript
+if (selectionVector[i] === 1) {
+    if (age[i] > 18)
+        keep row;
+}
+```
+
+This introduces branching.
+
+Modern CPUs suffer when branch prediction fails.
+
+---
+
+## Branchless Version
+
+We changed it to:
+
+```typescript
+selectionVector[i] &= age[i] > 18 ? 1 : 0;
+```
+
+Now the CPU executes a predictable tight loop:
+
+```
+for i = 0 to 1024:
+    selection[i] &= predicate(i)
+```
+
+Benefits:
+
+* Fewer branches
+* Better JIT optimization
+* SIMD-friendly code generation
+
+---
+
+# 7. The Unexpected Limitation — Strict 2PL
+
+After all optimizations, we expected:
+
+```
+5x - 10x speedups
+```
+
+But real measurements were much lower.
+
+Why?
+
+---
+
+## The Real Bottleneck Was Locking
+
+MiniDB uses row-level Strict 2PL.
+
+Every scan performs:
+
+```
+Read Tuple
+
+      |
+
+Acquire Shared Lock
+
+      |
+
+Return Data
+```
+
+For 250,000 rows:
+
+```
+250,000 lock acquisitions
+```
+
+Both:
+
+```
+Volcano
+```
+
+and
+
+```
+Vectorized
+```
+
+pay this cost.
+
+---
+
+## Amdahl's Law in Action
+
+Suppose:
+
+```
+Execution work:
+20 ms
+
+Locking:
+350 ms
+```
+
+Even if vectorization makes execution:
+
+```
+20 ms -> 2 ms
+```
+
+Total becomes:
+
+```
+Before:
+370 ms
+
+
+After:
+352 ms
+```
+
+The improvement is small.
+
+---
+
+# Engineering Lesson
+
+The bottleneck moved.
+
+Originally:
+
+```
+CPU execution overhead
+```
+
+After optimization:
+
+```
+Concurrency overhead
+```
+
+This is exactly what happens in production systems.
+
+Optimization exposes the next bottleneck.
+
+---
+
+# 8. Benchmark Results
+
+## Initial Measurements
+
+Without removing the iterator bottleneck:
+
+```
+Vectorized ≈ Volcano
+```
+
+The architecture change existed, but the implementation was inefficient.
+
+---
+
+## After Direct Page Decoding
+
+Performance improved:
+
+```
+10,000 rows:
+1.26x faster
+
+
+50,000 rows:
+1.82x faster
+
+
+250,000 rows:
+1.27x faster
+```
+
+---
+
+## Final Benchmark Configuration
+
+For the release benchmark suite:
+
+```
+10,000 rows
+50,000 rows
+100,000 rows
+```
+
+This avoided extremely long benchmark times while clearly demonstrating scaling behavior.
+
+---
+
+# 9. Benchmark Engineering Challenges
+
+While creating the final benchmark suite, several practical issues appeared.
+
+---
+
+## Problem 1: 1 Million Row Benchmark
+
+Originally:
+
+```
+1,000,000 rows
+```
+
+were tested.
+
+The problem was not the database algorithm.
+
+The benchmark became dominated by:
+
+* Millions of insert operations
+* B+ Tree maintenance
+* WAL generation
+* Lock acquisition
+
+The benchmark ran for several minutes.
+
+---
+
+## Solution
+
+Reduce benchmark sizes to:
+
+```
+10K
+50K
+100K
+```
+
+This still demonstrates:
+
+* O(N) sequential scans
+* O(log N) index lookups
+* Vectorization benefits
+
+while keeping execution under a few minutes.
+
+---
+
+## Problem 2: File Handle Leaks
+
+Early benchmarks directly created:
+
+```
+DiskManager
+LogManager
+BufferPool
+```
+
+and occasionally forgot cleanup.
+
+Node.js warned:
+
+```
+Closing FileHandle on garbage collection is deprecated
+```
+
+---
+
+## Final Solution
+
+All benchmarks were refactored to use:
+
+```typescript
+const db = new MiniDB();
+```
+
+and:
+
+```typescript
+try {
+    run benchmark
+}
+finally {
+    await db.close();
+}
+```
+
+which guarantees:
+
+* WAL flush
+* Buffer flush
+* Deadlock detector shutdown
+* File handle closure
+
+---
+
+# 10. Final Lessons from Vectorization
+
+The vectorized engine became one of the most educational components of MiniDB.
+
+The key lessons were:
+
+---
+
+## Lesson 1
+
+Architecture alone does not create performance.
+
+A vector API built on a row-by-row implementation still behaves like a row engine.
+
+---
+
+## Lesson 2
+
+Memory layout matters.
+
+```
+Object Arrays
+      ↓
+Typed Arrays
+```
+
+dramatically improve CPU efficiency.
+
+---
+
+## Lesson 3
+
+Optimizing one subsystem reveals the next bottleneck.
+
+```
+Volcano overhead
+       ↓
+Fixed
+       ↓
+Lock overhead dominates
+```
+
+---
+
+## Lesson 4
+
+Benchmarking is an engineering discipline.
+
+Microbenchmarks can lie.
+
+A realistic benchmark must include:
+
+* I/O
+* Locks
+* Logging
+* Memory allocation
+* Index maintenance
+
+---
+
+# Final Viva Defense Statement
+
+> We did not simply implement a vectorized API. During benchmarking we discovered that our initial design still suffered from tuple-level asynchronous overhead. We redesigned the scan path to decode 4KB pages directly into typed column vectors, removed intermediate tuple allocations, and optimized filter execution using branchless selection vectors. The final performance demonstrated meaningful speedups, while also revealing that strict row-level 2PL became the dominant bottleneck, illustrating Amdahl's Law and the trade-offs real database systems face.
+
+---
+
+
+# Benchmark Validation, Major Bugs, Production Audit, Engineering Trade-offs & Final Lessons
+
+---
+
+# Chapter 6: The Difference Between a Working Database and a Correct Database
+
+By the end of implementation, MiniDB could:
+
+* Execute SQL queries.
+* Store tuples.
+* Use B+ Tree indexes.
+* Run transactions.
+* Recover from crashes.
+* Execute vectorized analytical queries.
+
+At first glance, the system appeared complete.
+
+However, database systems are among the most correctness-sensitive pieces of software ever written.
+
+A normal application bug might cause:
+
+```
+User sees an incorrect webpage.
+```
+
+A database bug can cause:
+
+```
+Silent corruption of data written months ago.
+```
+
+The most important engineering phase of MiniDB was therefore not writing features.
+
+It was **proving that the features were actually correct.**
+
+We conducted a complete Red Team style production audit involving:
+
+* Stress testing.
+* Crash simulations.
+* Fuzz testing.
+* Invariant checking.
+* Code review.
+* Benchmark validation.
+
+This phase discovered some of the most interesting bugs of the entire project.
+
+---
+
+# 1. Cost-Based Optimizer Validation Journey
+
+---
+
+## The Initial Problem
+
+During early demonstrations:
+
+```sql
+CREATE TABLE users(id INT, age INT);
+
+CREATE INDEX idx_id ON users(id);
+
+SELECT * FROM users WHERE id = 2;
+```
+
+The query worked.
+
+However:
+
+```sql
+EXPLAIN SELECT * FROM users WHERE id = 2;
+```
+
+showed:
+
+```
+phys_seq_scan
+```
+
+instead of:
+
+```
+phys_index_scan
+```
+
+This looked like an optimizer failure.
+
+---
+
+# Root Cause #1: Small Tables Should Not Use Indexes
+
+Initially, the table contained only:
+
+```
+3 rows
+```
+
+The cost model correctly estimated:
+
+```
+Sequential Scan Cost ≈ 1
+Index Scan Cost > 1
+```
+
+Therefore:
+
+```
+SeqScan wins.
+```
+
+This was actually the expected behavior.
+
+---
+
+# Root Cause #2: Missing Statistics
+
+When testing with larger datasets, another issue appeared.
+
+Even with:
+
+```
+10000 rows
+```
+
+the optimizer sometimes still chose a sequential scan.
+
+The reason:
+
+```
+ANALYZE
+```
+
+was only recording:
+
+```
+rowCount
+```
+
+but not column-level statistics.
+
+---
+
+## Original Problem
+
+The catalog contained:
+
+```json
+{
+  "rowCount": 10000,
+  "columnStats": {}
+}
+```
+
+Therefore the optimizer did not know:
+
+* Minimum value.
+* Maximum value.
+* Number of distinct values.
+
+The selectivity estimation fell back to defaults:
+
+```
+Selectivity = 10%
+```
+
+---
+
+# The Fix
+
+ANALYZE was upgraded to scan the entire table and compute:
+
+```
+ColumnStats
+{
+    min,
+    max,
+    nDistinct
+}
+```
+
+Example:
+
+```
+id column:
+min = 1
+max = 10000
+nDistinct = 10000
+```
+
+Now:
+
+```
+WHERE id = 9999
+```
+
+was estimated as:
+
+```
+Selectivity = 1 / nDistinct
+
+= 1 / 10000
+
+= 0.0001
+```
+
+---
+
+# Final Optimizer Decision
+
+The cost model compared:
+
+```
+SeqScan Cost:
+100
+
+Index Cost:
+4
+```
+
+Result:
+
+```
+IndexScan selected.
+```
+
+Final plan:
+
+```
+phys_project
+      |
+phys_filter
+      |
+phys_index_scan
+```
+
+---
+
+# Final Performance Result
+
+```
+Dataset:
+100000 rows
+
+Query:
+SELECT * FROM users WHERE id = 50000
+
+
+Sequential Scan:
+≈ 164 ms
+
+
+B+ Tree Lookup:
+≈ 0.03 ms
+
+
+Speedup:
+≈ 5000x
+```
+
+---
+
+# 2. The Hidden B+ Tree Root Persistence Bug
+
+---
+
+## The Discovery
+
+One of the most dangerous bugs discovered during the audit involved B+ Tree root splitting.
+
+Initially:
+
+```
+Catalog.json
+
+index_root = Page 1
+```
+
+The B+ Tree grows:
+
+```
+Insert more keys
+       |
+Leaf splits
+       |
+Root splits
+       |
+New root created
+```
+
+Internally:
+
+```
+BPlusTree._rootPageId
+```
+
+was updated.
+
+However:
+
+```
+Catalog.json
+```
+
+still pointed to the old root.
+
+---
+
+# Why This Was Catastrophic
+
+Before restart:
+
+```
+Memory:
+
+root = Page 5
+```
+
+Everything worked.
+
+After restarting:
+
+```
+Catalog loads:
+
+root = Page 1
+```
+
+The database would begin searching from a stale node.
+
+Result:
+
+```
+Index corruption.
+Lost access paths.
+Incorrect query results.
+```
+
+---
+
+# The Architectural Fix
+
+A naive solution would have been:
+
+```
+BPlusTree → Catalog dependency
+```
+
+This would create circular coupling.
+
+Instead we introduced:
+
+```
+onRootChange callback
+```
+
+Architecture:
+
+```
+BPlusTree
+      |
+      | callback
+      v
+Catalog.updateIndexRoot()
+      |
+      v
+catalog.json
+```
+
+Now every root change is immediately persisted.
+
+---
+
+# Regression Test
+
+A dedicated test inserted:
+
+```
+1000 keys
+```
+
+forcing multiple root splits.
+
+Then:
+
+```
+Shutdown database.
+Restart database.
+Reload catalog.
+Search all keys.
+```
+
+Result:
+
+```
+1000 / 1000 keys found successfully.
+```
+
+---
+
+# 3. The Heap vs B+ Tree Page Corruption Bug
+
+---
+
+## Original Storage Design
+
+MiniDB stores:
+
+```
+Heap Pages
+
+and
+
+B+ Tree Pages
+```
+
+inside the same physical database file:
+
+```
+minidb.db
+```
+
+---
+
+## The Bug
+
+Heap scans assumed:
+
+```
+Every page is a tuple page.
+```
+
+During:
+
+```
+ANALYZE users
+```
+
+the scanner encountered:
+
+```
+B+ Tree internal node page
+```
+
+and attempted:
+
+```
+deserializeTuple(random bytes)
+```
+
+Result:
+
+```
+Out-of-bounds reads.
+Corrupted tuple decoding.
+Crashes.
+```
+
+---
+
+# The Fix
+
+The page header was extended with:
+
+```
+PageType
+```
+
+Example:
+
+```
+0 = Heap Page
+
+1 = B+ Tree Leaf
+
+2 = B+ Tree Internal
+```
+
+Now scans perform:
+
+```
+Read page header
+
+       |
+       |
+Is Heap?
+       |
+      Yes
+       |
+Deserialize tuples
+
+
+No
+ |
+Skip page
+```
+
+---
+
+# 4. The ARIES Undo LSN Corruption Bug
+
+---
+
+## The Crash
+
+During recovery tests:
+
+```
+ERR_OUT_OF_RANGE
+```
+
+appeared while reading the WAL.
+
+The parser attempted:
+
+```
+beforeLength = 4 million bytes
+```
+
+even though the WAL was only around:
+
+```
+1 MB
+```
+
+---
+
+# Investigation
+
+The issue was in the Undo pass.
+
+The invalid LSN marker was:
+
+```
+-1
+```
+
+However the stopping condition checked:
+
+```
+LSN == 0
+```
+
+Therefore:
+
+```
+-1
+```
+
+was treated as a valid log position.
+
+---
+
+## What Happened Next
+
+Node.js:
+
+```
+read(fd, buffer, offset, length, position=-1)
+```
+
+does not mean:
+
+```
+read before the file
+```
+
+Instead it means:
+
+```
+Use current file cursor.
+```
+
+The recovery engine read:
+
+```
+Random bytes
+```
+
+from the middle of the WAL.
+
+The decoder interpreted garbage as:
+
+```
+Huge beforeImage length
+```
+
+causing:
+
+```
+ERR_OUT_OF_RANGE
+```
+
+---
+
+# The Fix
+
+The Undo stopping condition became:
+
+```
+if LSN == INVALID_LSN (-1)
+    stop.
+```
+
+---
+
+# Validation
+
+Crash test:
+
+```
+T1:
+Insert 10000 rows
+COMMIT
+
+
+T2:
+Delete 500 rows
+NO COMMIT
+
+
+CRASH
+```
+
+After recovery:
+
+```
+Rows remaining:
+10000
+```
+
+All committed data survived.
+
+All uncommitted deletes were undone.
+
+---
+
+# 5. Page Header Metadata Corruption Bug
+
+Another subtle storage bug appeared.
+
+Initially:
+
+```
+PageLSN
+```
+
+was being written using a hardcoded byte offset.
+
+Example:
+
+```
+writeBigInt64(offset=16)
+```
+
+Unfortunately:
+
+```
+Offset 16
+```
+
+overlapped with other page metadata.
+
+Result:
+
+```
+PageType
+Slot Directory
+Header fields
+```
+
+could be corrupted.
+
+---
+
+# The Fix
+
+The Page class became the single authority for layout.
+
+Instead of:
+
+```
+Magic Numbers
+```
+
+we introduced:
+
+```
+Page.PAGE_LSN_OFFSET
+
+Page.PAGE_TYPE_OFFSET
+
+Page.SLOT_OFFSET
+```
+
+Now:
+
+```
+BufferPool
+      |
+      |
+Page API
+      |
+      |
+Binary Layout
+```
+
+All metadata modifications go through one consistent interface.
+
+---
+
+# 6. Crash Matrix Testing
+
+Normal unit tests prove:
+
+```
+Code works when everything goes right.
+```
+
+Databases must prove:
+
+```
+Data survives when everything goes wrong.
+```
+
+---
+
+We built destructive crash scenarios.
+
+---
+
+## Scenario A
+
+Crash after:
+
+```
+INSERT
+```
+
+but before:
+
+```
+COMMIT
+```
+
+Result:
+
+```
+Tuple disappears.
+```
+
+---
+
+## Scenario B
+
+Crash after:
+
+```
+WAL flush
+```
+
+but before:
+
+```
+Page flush
+```
+
+Result:
+
+```
+Redo restores tuple.
+```
+
+---
+
+## Scenario C
+
+Crash after:
+
+```
+COMMIT record persisted
+```
+
+but before:
+
+```
+Client acknowledgement.
+```
+
+Result:
+
+```
+Transaction survives.
+```
+
+---
+
+## Scenario D
+
+Repeated recovery.
+
+```
+Recover()
+Recover()
+Recover()
+```
+
+Result:
+
+```
+No duplicate rows.
+```
+
+Because:
+
+```
+pageLSN < logLSN
+```
+
+prevents applying the same operation twice.
+
+---
+
+# 7. Concurrency Stress Testing
+
+---
+
+## Deadlock Scenario
+
+```
+T1:
+Lock A
+Wait B
+
+
+T2:
+Lock B
+Wait A
+```
+
+Wait-for graph:
+
+```
+T1 → T2
+↑     ↓
+└─────┘
+```
+
+---
+
+## Detection
+
+The background detector:
+
+```
+Runs every interval
+       |
+Builds Wait-for Graph
+       |
+DFS cycle detection
+       |
+Abort youngest transaction
+```
+
+---
+
+## Result
+
+The cycle is broken automatically.
+
+No transaction waits forever.
+
+---
+
+# 8. SQL Fuzz Testing
+
+Unit tests are predictable.
+
+Real users are not.
+
+A random workload generator executed:
+
+```
+1000 random operations:
+```
+
+including:
+
+```
+INSERT
+
+DELETE
+
+SELECT
+```
+
+MiniDB state was compared against:
+
+```
+JavaScript reference Map
+```
+
+---
+
+Result:
+
+```
+All states matched.
+```
+
+No:
+
+* Lost tuples.
+* Duplicate records.
+* Index inconsistencies.
+
+---
+
+# 9. Final Benchmark Suite
+
+The final release benchmark suite covered the entire system.
+
+---
+
+## B+ Tree vs Sequential Scan
+
+Demonstrated:
+
+```
+O(log N)
+vs
+O(N)
+```
+
+Performance:
+
+```
+100000 rows
+
+SeqScan:
+≈ 164 ms
+
+B+ Tree:
+≈ 0.03 ms
+
+≈ 5000x speedup
+```
+
+---
+
+## Buffer Pool Cold vs Warm Cache
+
+Cold:
+
+```
+Disk Reads
+High latency
+```
+
+Warm:
+
+```
+Memory Hits
+Near-zero I/O
+```
+
+Demonstrated the value of caching.
+
+---
+
+## LRU-K Benchmark
+
+Compared:
+
+```
+Traditional LRU
+```
+
+against:
+
+```
+LRU-K
+```
+
+under workloads mixing:
+
+```
+Hot index pages
++
+Large sequential scans
+```
+
+Result:
+
+```
+LRU-K preserved frequently accessed pages
+and avoided cache pollution.
+```
+
+---
+
+## Vectorized Execution
+
+Demonstrated:
+
+```
+~2x speedup
+```
+
+through:
+
+* DataChunk batching.
+* Typed arrays.
+* Branchless filtering.
+* Reduced interpretation overhead.
+
+---
+
+# 10. Final Production Audit Verdict
+
+After:
+
+* Crash matrix testing.
+* Deadlock testing.
+* Fuzzing.
+* Benchmarking.
+* Manual code review.
+
+The final audit reported:
+
+```
+Critical Issues:
+0
+
+
+High Severity:
+0
+
+
+Medium:
+2
+
+
+Low:
+5
+```
+
+---
+
+# Accepted Design Limitations
+
+---
+
+## No MVCC
+
+MiniDB uses:
+
+```
+Strict 2PL
+```
+
+Therefore:
+
+```
+Readers block writers.
+Writers block readers.
+```
+
+The benefit:
+
+```
+Simple, deterministic serializability.
+```
+
+The tradeoff:
+
+```
+Lower concurrency.
+```
+
+---
+
+## Catalog Not WAL Protected
+
+DDL metadata is stored in:
+
+```
+catalog.json
+```
+
+A crash during catalog modification can theoretically cause metadata inconsistency.
+
+Production databases store catalog changes inside the WAL.
+
+---
+
+## Manual Pin/Unpin
+
+Pages require explicit:
+
+```
+fetchPage()
+
+unpinPage()
+```
+
+Future versions would use RAII-style guards to guarantee cleanup.
+
+---
+
+# Final Engineering Lessons
+
+The biggest lesson from MiniDB was that database engineering is not simply implementing algorithms.
+
+Every subsystem interacts:
+
+```
+Optimizer
+    ↓
+Execution
+    ↓
+Lock Manager
+    ↓
+Buffer Pool
+    ↓
+Storage
+    ↓
+WAL
+    ↓
+Recovery
+```
+
+A small mistake at any layer can corrupt the entire database.
+
+---
+
+# Final Closing Statement
+
+> MiniDB was designed not only as a feature-complete relational database but as an exploration of real database engineering tradeoffs. We implemented a complete path from SQL parsing to physical storage, including a cost-based optimizer, Volcano and vectorized execution engines, Strict 2PL concurrency control, ARIES-style crash recovery, and an LRU-K buffer manager. More importantly, the final stages focused on correctness through crash simulation, fuzz testing, and invariant audits, where several deep storage and recovery bugs were discovered and resolved. The project demonstrates not just how databases work when everything is correct, but how they maintain correctness when everything fails.
+
+---
+# End of MiniDB Engineering Journey

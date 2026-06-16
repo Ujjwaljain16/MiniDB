@@ -10,7 +10,7 @@
     "dev": "node --import tsx src/shell/REPL.ts",
     "cli": "node --import tsx src/shell/REPL.ts",
     "test": "jest --config jest.config.cjs",
-    "bench": "node --import tsx tests/benchmarks/run_all.ts",
+    "bench": "node --import tsx benchmarks/run_all.ts",
     "build": "tsc",
     "typecheck": "tsc --noEmit"
   },

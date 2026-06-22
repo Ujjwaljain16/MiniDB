@@ -7,8 +7,10 @@
 
 **Members:**
 
-* [Full Name] — [Scaler Email] — Roll No: [Roll Number]
-* [Full Name] — [Scaler Email] — Roll No: [Roll Number]
+* [Ujjwal Jain] — [ujjwal.24bcs10173@sst.scaler.com] — Roll No: [10173]
+* [Ayaan Singh] — [ayaan.24bcs10659@sst.scaler.com] — Roll No: [10659]
+* [Rudray Mehra] — [rudray.24bcs10760@sst.scaler.com] — Roll No: [10760]
+
 
 ---
 

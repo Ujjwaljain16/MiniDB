@@ -156,21 +156,30 @@ export class Binder {
     for (const colName of cols) {
       const idx = entry.schema.findIndex(c => c.name === colName);
       if (idx === -1) throw new BindError(`Column '${colName}' not found in table '${stmt.table}'`);
+      if (colIndices.includes(idx)) throw new BindError(`Column '${colName}' is listed more than once`);
       colIndices.push(idx);
     }
-    
+
+    // Rows are bound in table column order, since InsertOp stores them as-is.
     const boundValues: BoundExpression[][] = [];
     for (const row of stmt.values) {
       if (row.length !== cols.length) {
         throw new BindError(`INSERT has ${row.length} values but ${cols.length} columns`);
       }
-      
-      const boundRow = row.map((val, i) => {
+
+      const boundRow: BoundExpression[] = entry.schema.map(() => ({ kind: 'bound_literal', value: null, type: 'UNKNOWN' }));
+      row.forEach((val, i) => {
         const boundVal = this.bindExpression(val, { tables: new Map() }); // no scope for literals
         const expectedType = entry.schema[colIndices[i]!]!.type;
         // Strict type checking for inserts
         this.checkType(boundVal, expectedType);
-        return boundVal;
+        boundRow[colIndices[i]!] = boundVal;
+      });
+      entry.schema.forEach((col, i) => {
+        const val = boundRow[i]!;
+        if (!col.nullable && val.kind === 'bound_literal' && val.value === null) {
+          throw new BindError(`Column '${col.name}' cannot be NULL`);
+        }
       });
       boundValues.push(boundRow);
     }
@@ -178,7 +187,7 @@ export class Binder {
     return {
       kind: 'insert',
       tableId: entry.tableId,
-      columns: stmt.columns,
+      columns: entry.schema.map(c => c.name),
       values: boundValues
     };
   }

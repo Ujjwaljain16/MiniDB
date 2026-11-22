@@ -156,6 +156,25 @@ describe('SQL correctness', () => {
     });
   });
 
+  describe('INSERT', () => {
+    it('places values by the named columns and fills the rest with NULL', async () => {
+      await loadUsers(3);
+      await db.execute("INSERT INTO users (age, id, name) VALUES (77, 100, 'zed')");
+      await db.execute('INSERT INTO users (id) VALUES (200)');
+      expect((await db.execute('SELECT * FROM users WHERE id = 100')).rows).toEqual([[100, 'zed', 77]]);
+      expect((await db.execute('SELECT * FROM users WHERE age = 77')).rows).toEqual([[100, 'zed', 77]]);
+      expect((await db.execute('SELECT * FROM users WHERE id = 200')).rows).toEqual([[200, null, null]]);
+    });
+
+    it('rejects NULL in a NOT NULL column and repeated columns', async () => {
+      await db.execute('CREATE TABLE t (id INT NOT NULL, label VARCHAR(10))');
+      await expect(db.execute("INSERT INTO t (label) VALUES ('x')")).rejects.toThrow(/Column 'id' cannot be NULL/);
+      await expect(db.execute("INSERT INTO t VALUES (NULL, 'x')")).rejects.toThrow(/Column 'id' cannot be NULL/);
+      await expect(db.execute('INSERT INTO t (id, id) VALUES (1, 2)')).rejects.toThrow(/listed more than once/);
+      expect((await db.execute('SELECT * FROM t')).rows).toEqual([]);
+    });
+  });
+
   describe('DELETE', () => {
     it('deletes every matching row when an index scan drives it', async () => {
       await loadUsers(2000);

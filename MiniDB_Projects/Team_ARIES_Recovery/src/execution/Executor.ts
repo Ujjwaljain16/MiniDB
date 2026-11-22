@@ -1,7 +1,8 @@
 import type { PhysicalNode } from '../optimizer/PhysicalPlan.js';
 import type { ExecContext, IOperator, TupleSlot } from '../common/interfaces.js';
 import type { ResultSet, PlanInfo } from '../common/types.js';
-import { describeNode, renderPlan, toPlanInfo } from '../optimizer/Explain.js';
+import { describeNode, formatExpr, renderPlan, toPlanInfo } from '../optimizer/Explain.js';
+import type { BoundExpression } from '../sql/LogicalPlan.js';
 
 import { SeqScanOp } from './operators/SeqScanOp.js';
 import { IndexScanOp } from './operators/IndexScanOp.js';
@@ -43,6 +44,13 @@ export class TrackedOperator implements IOperator {
     await this.inner.close();
     this.stats.elapsedMs += (performance.now() - s);
   }
+}
+
+/** `AS` alias, else the column name, qualified only when its table was aliased. */
+function outputName(expr: BoundExpression): string {
+  if (expr.alias) return expr.alias;
+  if (expr.kind === 'bound_col') return expr.tableAlias ? `${expr.tableAlias}.${expr.columnName}` : expr.columnName;
+  return formatExpr(expr);
 }
 
 export class Executor {
@@ -119,7 +127,7 @@ export class Executor {
     let output = plan;
     while (output.kind === 'phys_limit') output = output.child;
     if (output.kind === 'phys_project') {
-      columns = output.projections.map(p => p.alias || 'col');
+      columns = output.projections.map(outputName);
     } else if (output.kind === 'phys_seq_scan' || output.kind === 'phys_index_scan') {
       columns = output.schema.map(c => c.name);
     } else if (output.kind === 'phys_insert' || output.kind === 'phys_delete') {

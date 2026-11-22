@@ -145,6 +145,20 @@ describe('SQL correctness', () => {
     });
   });
 
+  describe('column names', () => {
+    it('uses the alias, else the column name, qualified only for aliased tables', async () => {
+      await loadUsers(5);
+      expect((await db.execute('SELECT * FROM users')).columns).toEqual(['id', 'name', 'age']);
+      expect((await db.execute('SELECT id, name AS n FROM users')).columns).toEqual(['id', 'n']);
+      expect((await db.execute('SELECT u.id, u.age AS years FROM users u')).columns).toEqual(['u.id', 'years']);
+      expect((await db.execute('SELECT * FROM users a JOIN users b ON a.id = b.id')).columns)
+        .toEqual(['a.id', 'a.name', 'a.age', 'b.id', 'b.name', 'b.age']);
+      const bStar = await db.execute('SELECT b.* FROM users a JOIN users b ON a.id = b.age');
+      expect(bStar.columns).toEqual(['b.id', 'b.name', 'b.age']);
+      expect((await db.execute('SELECT id FROM users LIMIT 1')).columns).toEqual(['id']);
+    });
+  });
+
   describe('EXPLAIN and plans', () => {
     const SELF_JOIN = 'SELECT u1.id, u2.id FROM users u1 JOIN users u2 ON u1.id = u2.age WHERE u1.id = 25';
 

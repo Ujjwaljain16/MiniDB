@@ -114,4 +114,17 @@ describe('HeapFile', () => {
     expect(results[0]).toEqual([10, 'A']);
     expect(results[1]).toEqual([20, 'B']);
   });
+
+  it('fills pages to the brim without overflowing them', async () => {
+    // One 10-byte record, then 29-byte ones, leaves exactly 32 free bytes on page 1:
+    // enough for the record by the FSM's 16-byte count, but not for record + slot entry.
+    await hf.insertTuple([0, 'abc'], schema);
+    const name = 'n'.repeat(22);
+    for (let i = 1; i <= 300; i++) {
+      await hf.insertTuple([i, name], schema);
+    }
+    let count = 0;
+    for await (const _ of hf.scan(schema)) count++;
+    expect(count).toBe(301);
+  });
 });

@@ -7,7 +7,7 @@ import { DiskManager } from './DiskManager.js';
 import { FreeSpaceMap } from './FreeSpaceMap.js';
 import type { ExecContext } from '../common/interfaces.js';
 import { LogType } from '../common/interfaces.js';
-import { DEFAULT_HEAP_ID } from '../common/config.js';
+import { DEFAULT_HEAP_ID, SLOT_ENTRY_SIZE } from '../common/config.js';
 
 export function serializeTuple(tuple: Tuple, schema: Schema): Buffer {
   const nullBitmapLen = Math.ceil(schema.length / 8);
@@ -199,7 +199,8 @@ export class HeapFile implements IHeapFile {
     const buf = serializeTuple(tuple, schema);
     const requiredBytes = buf.length;
 
-    let targetPageId = await this.fsm.findFreePageAmong(requiredBytes, own);
+    // A new record also needs a slot directory entry on the page
+    let targetPageId = await this.fsm.findFreePageAmong(requiredBytes + SLOT_ENTRY_SIZE, own);
     let pageBuf: Buffer;
 
     if (targetPageId !== null) {

@@ -105,12 +105,16 @@ export class Catalog implements ICatalog {
   async createIndex(tableId: TableId, def: IndexDef): Promise<void> {
     const table = this.getTable(tableId);
     const colDef = table.schema.find(c => c.name === def.column);
-    table.indexes[def.indexId as any] = {
-      ...def,
-      tree: new BPlusTree(this.bufferPool, colDef!, def.rootPageId, async (newRoot) => {
-        await this.updateIndexRoot(tableId, def.indexId, newRoot);
-      })
-    };
+    const tree = new BPlusTree(this.bufferPool, colDef!, def.rootPageId, async (newRoot) => {
+      await this.updateIndexRoot(tableId, def.indexId, newRoot);
+    });
+    table.indexes[def.indexId as any] = { ...def, tree };
+
+    const colIdx = table.schema.findIndex(c => c.name === def.column);
+    for await (const [rid, tuple] of table.heapFile.scan(table.schema)) {
+      const key = tuple[colIdx];
+      if (key !== null && key !== undefined) await tree.insert(key, rid);
+    }
     await this.flush();
   }
 

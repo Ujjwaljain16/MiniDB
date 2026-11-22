@@ -139,6 +139,10 @@ export class Binder {
       projections: boundProjections
     };
 
+    if (stmt.limit !== undefined) {
+      plan = { kind: 'limit', child: plan, limit: stmt.limit };
+    }
+
     return plan;
   }
 

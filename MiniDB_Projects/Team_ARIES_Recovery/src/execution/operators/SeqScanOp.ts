@@ -5,7 +5,7 @@ import { LockMode } from '../../common/interfaces.js';
 import type { RID, Tuple } from '../../common/types.js';
 
 export class SeqScanOp extends Operator {
-  private iterator!: AsyncIterableIterator<[RID, Tuple]>;
+  private iterator: AsyncIterableIterator<[RID, Tuple]> | undefined;
 
   constructor(private plan: PhysSeqScan) {
     super();
@@ -23,7 +23,7 @@ export class SeqScanOp extends Operator {
   }
 
   async next(): Promise<TupleSlot | null> {
-    const result = await this.iterator.next();
+    const result = await this.iterator!.next();
     if (result.done) {
       return null;
     }
@@ -37,7 +37,8 @@ export class SeqScanOp extends Operator {
   }
 
   async close(): Promise<void> {
-    // Async iterators from generator functions don't usually need explicit close,
-    // but if we added early return/break logic to the generator, we could handle it here.
+    // Ending the generator early runs its finally block, which unpins the current page.
+    await this.iterator?.return?.();
+    this.iterator = undefined;
   }
 }

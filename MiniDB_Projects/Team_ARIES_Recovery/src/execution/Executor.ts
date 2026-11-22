@@ -9,6 +9,7 @@ import { ProjectOp } from './operators/ProjectOp.js';
 import { NestedLoopJoinOp } from './operators/NestedLoopJoinOp.js';
 import { InsertOp } from './operators/InsertOp.js';
 import { DeleteOp } from './operators/DeleteOp.js';
+import { LimitOp } from './operators/LimitOp.js';
 
 export interface OperatorStats {
   rowsProduced: number;
@@ -65,6 +66,9 @@ export class Executor {
       case 'phys_project':
         inner = new ProjectOp(plan, buildChild as any);
         break;
+      case 'phys_limit':
+        inner = new LimitOp(plan, buildChild as any);
+        break;
       case 'phys_nlj':
         inner = new NestedLoopJoinOp(plan, buildChild as any);
         break;
@@ -90,18 +94,21 @@ export class Executor {
     const root = this.buildOperatorTree(plan);
     const rows: any[][] = [];
 
-    await root.open(ctx);
-
-    while (true) {
-      const slot = await root.next();
-      if (!slot) break;
-      rows.push(slot.tuple);
+    try {
+      await root.open(ctx);
+      while (true) {
+        const slot = await root.next();
+        if (!slot) break;
+        rows.push(slot.tuple);
+      }
+    } finally {
+      // Always close so scans stopped early (LIMIT, errors) release their pinned pages.
+      await root.close();
     }
-
-    await root.close();
 
     // Determine output columns if possible
     let columns: string[] = [];
+    while (plan.kind === 'phys_limit') plan = plan.child;
     if (plan.kind === 'phys_project') {
       columns = plan.projections.map(p => p.alias || 'col');
     } else if (plan.kind === 'phys_seq_scan' || plan.kind === 'phys_index_scan') {

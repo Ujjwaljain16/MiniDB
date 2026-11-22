@@ -1,5 +1,5 @@
-import type { LogicalNode, LogicalScan, LogicalFilter, LogicalProject, LogicalJoin, LogicalInsert, LogicalDelete, BoundExpression, BoundColumnRef } from '../sql/LogicalPlan.js';
-import type { PhysicalNode, PhysSeqScan, PhysIndexScan, PhysFilter, PhysProject, PhysInsert, PhysDelete } from './PhysicalPlan.js';
+import type { LogicalNode, LogicalScan, LogicalFilter, LogicalProject, LogicalJoin, LogicalLimit, LogicalInsert, LogicalDelete, BoundExpression, BoundColumnRef } from '../sql/LogicalPlan.js';
+import type { PhysicalNode, PhysSeqScan, PhysIndexScan, PhysFilter, PhysProject, PhysLimit, PhysInsert, PhysDelete } from './PhysicalPlan.js';
 import type { ICatalog, TableStats, CatalogEntry } from '../common/interfaces.js';
 import { seqScanCost, indexScanCost, estimateSelectivity } from './CostModel.js';
 import { JoinOrderer, JoinNode } from './JoinOrderer.js';
@@ -36,6 +36,8 @@ export class PhysicalPlanner {
         return this.planFilter(node);
       case 'project':
         return this.planProject(node);
+      case 'limit':
+        return this.planLimit(node);
       case 'join':
         return this.planJoinTree(node, []);
       case 'insert':
@@ -153,6 +155,17 @@ export class PhysicalPlanner {
       estRows,
       estCost: child.estCost + child.estRows * 0.1 // small CPU cost for filtering
     };
+  }
+
+  private planLimit(node: LogicalLimit): PhysicalNode {
+    const childPlan = this.planNode(node.child);
+    return {
+      kind: 'phys_limit',
+      child: childPlan,
+      limit: node.limit,
+      estRows: Math.min(childPlan.estRows, node.limit),
+      estCost: childPlan.estCost
+    } as PhysLimit;
   }
 
   private planProject(node: LogicalProject): PhysicalNode {

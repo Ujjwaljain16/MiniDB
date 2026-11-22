@@ -145,6 +145,31 @@ describe('SQL correctness', () => {
     });
   });
 
+  describe('LIMIT', () => {
+    it('returns at most n rows and leaves no page pinned', async () => {
+      const rows = await loadUsers(3000);
+      expect(db.bufferPool.stats().pinnedPages).toBe(0);
+
+      const three = await db.execute('SELECT * FROM users LIMIT 3');
+      expect(three.rows.length).toBe(3);
+      expect(db.bufferPool.stats().pinnedPages).toBe(0);
+
+      const ranged = await db.execute('SELECT id FROM users WHERE id > 100 LIMIT 5');
+      expect(ranged.rows.length).toBe(5);
+      expect(ranged.rows.every(r => (r[0] as number) > 100)).toBe(true);
+      expect(db.bufferPool.stats().pinnedPages).toBe(0);
+
+      const joined = await db.execute('SELECT a.id, b.id FROM users a JOIN users b ON a.age = b.age LIMIT 4');
+      expect(joined.rows.length).toBe(4);
+      expect(joined.rows.every(r => rows[(r[0] as number) - 1]!.age === rows[(r[1] as number) - 1]!.age)).toBe(true);
+      expect(db.bufferPool.stats().pinnedPages).toBe(0);
+
+      expect((await db.execute('SELECT * FROM users LIMIT 0')).rows).toEqual([]);
+      expect((await db.execute('SELECT * FROM users WHERE id <= 10 LIMIT 50')).rows.length).toBe(10);
+      expect(db.bufferPool.stats().pinnedPages).toBe(0);
+    });
+  });
+
   describe('before ANALYZE', () => {
     it('chooses the index for an equality and returns the right rows', async () => {
       const rows = await loadUsers(300);

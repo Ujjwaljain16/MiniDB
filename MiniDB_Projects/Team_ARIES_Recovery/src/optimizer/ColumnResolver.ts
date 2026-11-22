@@ -30,6 +30,7 @@ function resolve(node: PhysicalNode): { node: PhysicalNode; layout: LayoutEntry[
       const child = resolve(node.child);
       return { node: { ...node, child: child.node, predicate: rewrite(node.predicate, child.layout) }, layout: child.layout };
     }
+    case 'phys_limit':
     case 'phys_delete': {
       const child = resolve(node.child);
       return { node: { ...node, child: child.node }, layout: child.layout };

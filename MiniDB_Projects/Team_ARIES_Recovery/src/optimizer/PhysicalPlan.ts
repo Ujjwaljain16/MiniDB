@@ -6,6 +6,7 @@ export type PhysicalNode =
   | PhysIndexScan
   | PhysFilter
   | PhysProject
+  | PhysLimit
   | PhysNLJ
   | PhysHashJoin
   | PhysInsert
@@ -52,6 +53,12 @@ export interface PhysProject extends PhysBase {
   kind: 'phys_project';
   child: PhysicalNode;
   projections: BoundExpression[];
+}
+
+export interface PhysLimit extends PhysBase {
+  kind: 'phys_limit';
+  child: PhysicalNode;
+  limit: number;
 }
 
 export interface PhysNLJ extends PhysBase {

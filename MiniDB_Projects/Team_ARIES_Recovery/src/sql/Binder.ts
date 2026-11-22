@@ -107,8 +107,12 @@ export class Binder {
     const boundProjections: BoundExpression[] = [];
     for (const proj of stmt.projections) {
       if (proj.kind === 'star') {
-        // Expand star to all columns in scope
+        if (proj.table && !scope.tables.has(proj.table)) {
+          throw new BindError(`Table or alias '${proj.table}' not found`);
+        }
+        // Expand star to all columns in scope (or of the one table named in `t.*`)
         for (const [refName, { entry }] of scope.tables.entries()) {
+          if (proj.table && proj.table !== refName) continue;
           for (let i = 0; i < entry.schema.length; i++) {
             const col = entry.schema[i]!;
             const boundCol: BoundColumnRef = {

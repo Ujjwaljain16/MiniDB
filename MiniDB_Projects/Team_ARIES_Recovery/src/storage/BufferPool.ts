@@ -1,8 +1,7 @@
-import type { IBufferPool, BufferPoolStats, ILogManager } from '../common/interfaces.js';
+import type { IBufferPool, BufferPoolStats, ILogManager, IDiskManager } from '../common/interfaces.js';
 import type { PageId, LSN } from '../common/types.js';
 import { INVALID_LSN } from '../common/types.js';
 import { PAGE_SIZE } from '../common/config.js';
-import { DiskManager } from './DiskManager.js';
 import { Page } from './Page.js';
 interface Frame {
   pageId:     PageId;
@@ -30,7 +29,7 @@ export class BufferPool implements IBufferPool {
   };
 
   constructor(
-    private diskManager: DiskManager,
+    private diskManager: IDiskManager,
     private logManager: ILogManager,
     private poolSize: number = 64
   ) {

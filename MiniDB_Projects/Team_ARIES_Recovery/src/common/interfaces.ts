@@ -39,6 +39,20 @@ export interface BufferPoolStats {
 }
 
 /**
+ * IDiskManager — page-granular storage under the buffer pool.
+ * Implementations must copy page bytes in and out; callers reuse their buffers.
+ */
+export interface IDiskManager {
+  /** Read a page into `buf`. Pages past the end read as zeros. */
+  readPage(pageId: PageId, buf: Buffer): Promise<void>;
+  writePage(pageId: PageId, buf: Buffer): Promise<void>;
+  /** Append a zeroed page and return its id. */
+  allocatePage(): Promise<PageId>;
+  getPageCount(): number;
+  close(): Promise<void>;
+}
+
+/**
  * IBufferPool — the central cache between disk I/O and all upper layers.
  *
  * Contract:

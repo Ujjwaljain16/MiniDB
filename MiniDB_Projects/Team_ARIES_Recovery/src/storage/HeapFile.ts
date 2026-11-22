@@ -1,9 +1,7 @@
-import type { IHeapFile, IBufferPool } from '../common/interfaces.js';
+import type { IHeapFile, IBufferPool, IDiskManager } from '../common/interfaces.js';
 import type { Tuple, Schema, RID, PageId } from '../common/types.js';
 import { makeRID, colByteSize } from '../common/types.js';
 import { Page } from './Page.js';
-import { BufferPool } from './BufferPool.js';
-import { DiskManager } from './DiskManager.js';
 import { FreeSpaceMap } from './FreeSpaceMap.js';
 import type { ExecContext } from '../common/interfaces.js';
 import { LogType } from '../common/interfaces.js';
@@ -114,7 +112,7 @@ export function deserializeTuple(buf: Buffer, schema: Schema): Tuple {
 }
 
 /** Create the FSM page as page 0 if the data file is still empty. */
-export async function ensureFsmPage(bufferPool: IBufferPool, diskManager: DiskManager): Promise<void> {
+export async function ensureFsmPage(bufferPool: IBufferPool, diskManager: IDiskManager): Promise<void> {
   if (diskManager.getPageCount() === 0) {
     const [pageId, buf] = await bufferPool.newPage();
     // Expect pageId to be 0 for FSM
@@ -143,8 +141,8 @@ export class HeapFile implements IHeapFile {
    */
   constructor(
     private tableId: string,
-    private bufferPool: BufferPool,
-    private diskManager: DiskManager,
+    private bufferPool: IBufferPool,
+    private diskManager: IDiskManager,
     readonly heapId: number = DEFAULT_HEAP_ID,
     knownPages?: readonly PageId[]
   ) {

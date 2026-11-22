@@ -1,11 +1,12 @@
 import * as fs from 'fs/promises';
 import { constants } from 'fs';
 import type { PageId } from '../common/types.js';
+import type { IDiskManager } from '../common/interfaces.js';
 import { PAGE_SIZE } from '../common/config.js';
 
 import * as path from 'path';
 
-export class DiskManager {
+export class DiskManager implements IDiskManager {
   private fd: fs.FileHandle;
   private numPages: number;
 

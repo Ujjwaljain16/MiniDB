@@ -1,4 +1,4 @@
-import type { ICatalog, CatalogEntry, TableStats, IndexDef } from '../common/interfaces.js';
+import type { ICatalog, CatalogEntry, TableStats, IndexDef, IBufferPool, IDiskManager } from '../common/interfaces.js';
 import type { TableId, IndexId, PageId } from '../common/types.js';
 import { DEFAULT_HEAP_ID } from '../common/config.js';
 import type { CatalogStorage } from './CatalogStorage.js';
@@ -10,8 +10,8 @@ export class Catalog implements ICatalog {
 
   constructor(
     private readonly storage: CatalogStorage,
-    private readonly bufferPool: any,
-    private readonly diskManager: any
+    private readonly bufferPool: IBufferPool,
+    private readonly diskManager: IDiskManager
   ) {}
 
   async load(): Promise<void> {

@@ -4,6 +4,7 @@ jspm_packages/
 
 # Build artifacts
 dist/
+dist-browser/
 build/
 lib/
 *.tsbuildinfo

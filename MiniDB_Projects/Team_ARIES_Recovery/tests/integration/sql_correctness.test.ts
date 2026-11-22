@@ -98,6 +98,17 @@ describe('SQL correctness', () => {
     });
   });
 
+  describe('before ANALYZE', () => {
+    it('chooses the index for an equality and returns the right rows', async () => {
+      const rows = await loadUsers(300);
+      const explain = await db.execute('EXPLAIN SELECT * FROM users WHERE id = 5');
+      expect(String(explain.rows[0]![0])).toContain('phys_index_scan');
+      expect(await ids('SELECT id FROM users WHERE id = 5')).toEqual([5]);
+      expect(await ids('SELECT id FROM users WHERE id >= 290 AND age > 30'))
+        .toEqual(rows.filter(r => r.id >= 290 && r.age > 30).map(r => r.id));
+    });
+  });
+
   describe('unsupported SQL fails with a clear error', () => {
     beforeEach(async () => {
       await loadUsers(5);

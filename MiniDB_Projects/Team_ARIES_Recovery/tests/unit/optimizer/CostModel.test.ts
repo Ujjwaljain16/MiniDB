@@ -81,4 +81,19 @@ describe('CostModel', () => {
     // AND = 0.02 * 0.2 = 0.004
     expect(estimateSelectivity(expr, stats)).toBeCloseTo(0.004);
   });
+
+  it('uses PostgreSQL-style defaults when a column has no stats', () => {
+    const cmp = (op: string): BoundExpression => ({
+      kind: 'bound_binary',
+      op,
+      left: { kind: 'bound_col', columnName: 'score', columnIndex: 0, tableId: 'users' as any, type: 'INT' },
+      right: { kind: 'bound_literal', value: 5, type: 'INT' }
+    });
+    for (const s of [stats, undefined, { rowCount: 0, columnStats: {} }]) {
+      expect(estimateSelectivity(cmp('='), s)).toBe(0.005);
+      expect(estimateSelectivity(cmp('<'), s)).toBeCloseTo(1 / 3);
+      expect(estimateSelectivity(cmp('>='), s)).toBeCloseTo(1 / 3);
+      expect(estimateSelectivity(cmp('!='), s)).toBe(0.1);
+    }
+  });
 });

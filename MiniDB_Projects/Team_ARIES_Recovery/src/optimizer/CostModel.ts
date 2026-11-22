@@ -15,10 +15,6 @@ export function indexScanCost(rowCount: number, selectivity: number): number {
 
 export function estimateSelectivity(pred: BoundExpression, tableStats: TableStats | undefined): number {
   const DEFAULT_SELECTIVITY = 0.1;
-  
-  if (!tableStats || !tableStats.columnStats) {
-    return DEFAULT_SELECTIVITY;
-  }
 
   if (pred.kind === 'bound_logical') {
     const leftSel = estimateSelectivity(pred.left, tableStats);
@@ -55,8 +51,13 @@ export function estimateSelectivity(pred: BoundExpression, tableStats: TableStat
     return DEFAULT_SELECTIVITY;
   }
 
-  const stats = tableStats.columnStats[colNode.columnName];
-  if (!stats) return DEFAULT_SELECTIVITY;
+  const stats = tableStats?.columnStats?.[colNode.columnName];
+  if (!stats) {
+    // PostgreSQL's defaults for a column that has never been analyzed.
+    if (op === '=') return 0.005;
+    if (op === '<' || op === '<=' || op === '>' || op === '>=') return 1 / 3;
+    return DEFAULT_SELECTIVITY;
+  }
 
   switch (op) {
     case '=':

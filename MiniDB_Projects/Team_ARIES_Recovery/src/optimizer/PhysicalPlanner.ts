@@ -7,6 +7,19 @@ import { indexRange, andAll, splitConjuncts } from './Predicates.js';
 import { compareKeys } from '../index/BPlusKeyUtils.js';
 import type { TableId, IndexId, ColValue } from '../common/types.js';
 
+const FALLBACK_ROW_COUNT = 1000;
+
+/**
+ * A table that was never analyzed has `{rowCount: 0, columnStats: {}}`; costing
+ * it as empty makes every seq scan free, so assume a modest size instead.
+ */
+function effectiveStats(stats: TableStats | undefined): TableStats {
+  if (!stats || (stats.rowCount === 0 && Object.keys(stats.columnStats ?? {}).length === 0)) {
+    return { rowCount: FALLBACK_ROW_COUNT, columnStats: {} };
+  }
+  return stats;
+}
+
 export class PhysicalPlanner {
   constructor(private catalog: ICatalog) {}
 
@@ -36,17 +49,7 @@ export class PhysicalPlanner {
    */
   private planScan(node: LogicalScan, conjuncts: BoundExpression[] = []): PhysicalNode {
     const entry = this.catalog.getTable(node.tableId);
-    let stats: TableStats;
-    try {
-      stats = entry.stats;
-      if (!stats) throw new Error();
-    } catch {
-      // Fallback statistics
-      stats = {
-        rowCount: 1000,
-        columnStats: {}
-      };
-    }
+    const stats = effectiveStats(entry.stats);
 
     const seqCost = seqScanCost(stats.rowCount);
     let bestCost = seqCost;
@@ -125,11 +128,9 @@ export class PhysicalPlanner {
     let stats: TableStats | undefined;
     if (tableId) {
       try {
-        const entry = this.catalog.getTable(tableId);
-        stats = entry.stats;
-        if (!stats) throw new Error();
+        stats = effectiveStats(this.catalog.getTable(tableId).stats);
       } catch {
-        stats = { rowCount: 1000, columnStats: {} };
+        stats = effectiveStats(undefined);
       }
     }
     

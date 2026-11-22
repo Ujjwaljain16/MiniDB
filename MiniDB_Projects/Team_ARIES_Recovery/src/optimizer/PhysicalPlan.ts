@@ -1,4 +1,4 @@
-import type { TableId, IndexId, Schema } from '../common/types.js';
+import type { TableId, IndexId, Schema, ColValue } from '../common/types.js';
 import type { BoundExpression } from '../sql/LogicalPlan.js';
 
 export type PhysicalNode =
@@ -6,6 +6,7 @@ export type PhysicalNode =
   | PhysIndexScan
   | PhysFilter
   | PhysProject
+  | PhysLimit
   | PhysNLJ
   | PhysHashJoin
   | PhysInsert
@@ -29,8 +30,17 @@ export interface PhysIndexScan extends PhysBase {
   indexId: IndexId;
   schema: Schema;
   alias?: string;
+  /** Indexed column name. */
+  keyColumn: string;
   // Extracted key condition
-  keyCondition?: BoundExpression; 
+  keyCondition?: BoundExpression;
+  /**
+   * Inclusive key range to scan; null means unbounded on that side. The scan
+   * may return extra rows (e.g. the boundary of a strict `>`), so the planner
+   * always keeps the full predicate in a filter above it.
+   */
+  lowKey: ColValue | null;
+  highKey: ColValue | null;
 }
 
 export interface PhysFilter extends PhysBase {
@@ -43,6 +53,12 @@ export interface PhysProject extends PhysBase {
   kind: 'phys_project';
   child: PhysicalNode;
   projections: BoundExpression[];
+}
+
+export interface PhysLimit extends PhysBase {
+  kind: 'phys_limit';
+  child: PhysicalNode;
+  limit: number;
 }
 
 export interface PhysNLJ extends PhysBase {

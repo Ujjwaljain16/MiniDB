@@ -30,6 +30,7 @@ export function evaluate(expr: BoundExpression, tuple: Tuple, schema: Schema): a
         case '<=': return left <= right;
         case '>': return left > right;
         case '>=': return left >= right;
+        case 'LIKE': return likeRegex(String(right)).test(String(left));
         default:
           throw new Error(`Unsupported binary operator: ${expr.op}`);
       }
@@ -50,4 +51,20 @@ export function evaluate(expr: BoundExpression, tuple: Tuple, schema: Schema): a
     default:
       throw new Error(`Unsupported expression kind: ${(expr as any).kind}`);
   }
+}
+
+const likeCache = new Map<string, RegExp>();
+
+/** SQL LIKE: `%` matches any run, `_` one character, and letters ignore case as in SQLite. */
+function likeRegex(pattern: string): RegExp {
+  let re = likeCache.get(pattern);
+  if (!re) {
+    const body = Array.from(pattern, ch =>
+      ch === '%' ? '[\\s\\S]*' : ch === '_' ? '[\\s\\S]' : ch.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    ).join('');
+    re = new RegExp(`^${body}$`, 'i');
+    if (likeCache.size >= 256) likeCache.clear();
+    likeCache.set(pattern, re);
+  }
+  return re;
 }

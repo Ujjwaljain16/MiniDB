@@ -1,23 +1,45 @@
-import type { LogicalNode, LogicalScan, LogicalFilter, LogicalProject, LogicalJoin, LogicalInsert, LogicalDelete, BoundExpression, BoundColumnRef } from '../sql/LogicalPlan.js';
-import type { PhysicalNode, PhysSeqScan, PhysIndexScan, PhysFilter, PhysProject, PhysInsert, PhysDelete } from './PhysicalPlan.js';
+import type { LogicalNode, LogicalScan, LogicalFilter, LogicalProject, LogicalJoin, LogicalLimit, LogicalInsert, LogicalDelete, BoundExpression, BoundColumnRef } from '../sql/LogicalPlan.js';
+import type { PhysicalNode, PhysSeqScan, PhysIndexScan, PhysFilter, PhysProject, PhysLimit, PhysInsert, PhysDelete } from './PhysicalPlan.js';
 import type { ICatalog, TableStats, CatalogEntry } from '../common/interfaces.js';
 import { seqScanCost, indexScanCost, estimateSelectivity } from './CostModel.js';
 import { JoinOrderer, JoinNode } from './JoinOrderer.js';
-import type { TableId } from '../common/types.js';
+import { indexRange, andAll, splitConjuncts, tablesReferenced } from './Predicates.js';
+import { resolveColumns } from './ColumnResolver.js';
+import { compareKeys } from '../index/BPlusKeyUtils.js';
+import type { TableId, IndexId, ColValue } from '../common/types.js';
+
+const FALLBACK_ROW_COUNT = 1000;
+
+/**
+ * A table that was never analyzed has `{rowCount: 0, columnStats: {}}`; costing
+ * it as empty makes every seq scan free, so assume a modest size instead.
+ */
+function effectiveStats(stats: TableStats | undefined): TableStats {
+  if (!stats || (stats.rowCount === 0 && Object.keys(stats.columnStats ?? {}).length === 0)) {
+    return { rowCount: FALLBACK_ROW_COUNT, columnStats: {} };
+  }
+  return stats;
+}
 
 export class PhysicalPlanner {
   constructor(private catalog: ICatalog) {}
 
   plan(node: LogicalNode): PhysicalNode {
+    return resolveColumns(this.planNode(node));
+  }
+
+  private planNode(node: LogicalNode): PhysicalNode {
     switch (node.kind) {
       case 'scan':
-        return this.planScan(node, undefined);
+        return this.planScan(node);
       case 'filter':
         return this.planFilter(node);
       case 'project':
         return this.planProject(node);
+      case 'limit':
+        return this.planLimit(node);
       case 'join':
-        return this.planJoinTree(node);
+        return this.planJoinTree(node, []);
       case 'insert':
         return this.planInsert(node);
       case 'delete':
@@ -27,19 +49,14 @@ export class PhysicalPlanner {
     }
   }
 
-  private planScan(node: LogicalScan, pushedPredicate?: BoundExpression): PhysicalNode {
+  /**
+   * Picks a seq scan or an index scan for `node`. `conjuncts` are AND-ed
+   * predicates on this table; the index scan uses those on its key column to
+   * bound the range, but the caller must still filter on all of them.
+   */
+  private planScan(node: LogicalScan, conjuncts: BoundExpression[] = []): PhysicalNode {
     const entry = this.catalog.getTable(node.tableId);
-    let stats: TableStats;
-    try {
-      stats = entry.stats;
-      if (!stats) throw new Error();
-    } catch {
-      // Fallback statistics
-      stats = {
-        rowCount: 1000,
-        columnStats: {}
-      };
-    }
+    const stats = effectiveStats(entry.stats);
 
     const seqCost = seqScanCost(stats.rowCount);
     let bestCost = seqCost;
@@ -52,46 +69,41 @@ export class PhysicalPlanner {
       estCost: seqCost
     } as PhysSeqScan;
 
-    // Check if we can use an index based on the pushed predicate
-    if (pushedPredicate && pushedPredicate.kind === 'bound_binary') {
-      const left = pushedPredicate.left;
-      const right = pushedPredicate.right;
+    const ref = node.alias ?? (node.tableId as string);
+    for (const [idxName, idxDef] of Object.entries(entry.indexes)) {
+      const colDef = entry.schema.find(c => c.name === idxDef.column);
+      if (!colDef) continue;
 
-      let colName: string | undefined;
-      
-      if (left.kind === 'bound_col' && right.kind === 'bound_literal') {
-        if (!left.tableAlias || left.tableAlias === node.alias || left.tableAlias === node.tableId) {
-          colName = left.columnName;
-        }
-      } else if (right.kind === 'bound_col' && left.kind === 'bound_literal') {
-        if (!right.tableAlias || right.tableAlias === node.alias || right.tableAlias === node.tableId) {
-          colName = right.columnName;
-        }
+      const keyConds: BoundExpression[] = [];
+      let low: ColValue | null = null;
+      let high: ColValue | null = null;
+      for (const conj of conjuncts) {
+        const range = indexRange(conj, idxDef.column, ref);
+        if (!range) continue;
+        keyConds.push(conj);
+        if (range.low !== null && (low === null || compareKeys(range.low, low, colDef) > 0)) low = range.low;
+        if (range.high !== null && (high === null || compareKeys(range.high, high, colDef) < 0)) high = range.high;
       }
+      if (keyConds.length === 0) continue;
 
-      if (colName) {
-        // Find if an index exists on this column
-        for (const [idxName, idxDef] of Object.entries(entry.indexes)) {
-          if (idxDef.column === colName) {
-            // Index available!
-            const selectivity = estimateSelectivity(pushedPredicate, stats);
-            const idxCost = indexScanCost(stats.rowCount, selectivity);
-            
-            if (idxCost < bestCost) {
-              bestCost = idxCost;
-              bestPlan = {
-                kind: 'phys_index_scan',
-                tableId: node.tableId,
-                indexId: idxName as any,
-                schema: node.schema,
-                alias: node.alias,
-                keyCondition: pushedPredicate,
-                estRows: Math.ceil(stats.rowCount * selectivity),
-                estCost: idxCost
-              } as PhysIndexScan;
-            }
-          }
-        }
+      const keyCondition = andAll(keyConds);
+      const selectivity = estimateSelectivity(keyCondition, stats);
+      const idxCost = indexScanCost(stats.rowCount, selectivity);
+      if (idxCost < bestCost) {
+        bestCost = idxCost;
+        bestPlan = {
+          kind: 'phys_index_scan',
+          tableId: node.tableId,
+          indexId: idxName as IndexId,
+          schema: node.schema,
+          alias: node.alias,
+          keyColumn: idxDef.column,
+          keyCondition,
+          lowKey: low,
+          highKey: high,
+          estRows: Math.ceil(stats.rowCount * selectivity),
+          estCost: idxCost
+        } as PhysIndexScan;
       }
     }
 
@@ -100,57 +112,64 @@ export class PhysicalPlanner {
 
   private planFilter(node: LogicalFilter): PhysicalNode {
     if (node.child.kind === 'scan') {
-      // Try to push the predicate down into the scan to trigger an index scan
-      const scanNode = this.planScan(node.child as LogicalScan, node.predicate);
-      
-      if (scanNode.kind === 'phys_index_scan') {
-        // The index scan inherently filters on this predicate
-        // However, if there are other conditions in the predicate (e.g. AND), we might still need a filter.
-        // For simplicity, if it became an index scan, we assume the index condition handles it.
-        // But what if it's `id = 5 AND age > 20`? 
-        // We should just wrap the index scan with the filter anyway. The index scan will return fewer rows.
-        // We'll wrap it for safety unless the engine natively drops the evaluated condition.
-        const estRows = scanNode.estRows; // filter further reduces it, but let's keep it simple
-        const estCost = scanNode.estCost;
-        return {
-          kind: 'phys_filter',
-          child: scanNode,
-          predicate: node.predicate,
-          estRows,
-          estCost
-        } as PhysFilter;
-      }
+      // The index range is only a superset of the matches, so the full predicate stays on top.
+      return this.planFilteredScan(node.child, splitConjuncts(node.predicate), node.predicate);
     }
 
-    const childPlan = this.plan(node.child);
+    if (node.child.kind === 'join') {
+      // Inner joins make WHERE and ON interchangeable, so the join planner places every conjunct.
+      return this.planJoinTree(node.child, splitConjuncts(node.predicate));
+    }
+
+    const childPlan = this.planNode(node.child);
     const tableId = this.extractTableId(node.child);
-    
+
     let stats: TableStats | undefined;
     if (tableId) {
       try {
-        const entry = this.catalog.getTable(tableId);
-        stats = entry.stats;
-        if (!stats) throw new Error();
+        stats = effectiveStats(this.catalog.getTable(tableId).stats);
       } catch {
-        stats = { rowCount: 1000, columnStats: {} };
+        stats = effectiveStats(undefined);
       }
     }
-    
-    const sel = estimateSelectivity(node.predicate, stats);
-    const estRows = Math.ceil(childPlan.estRows * sel);
-    const estCost = childPlan.estCost + childPlan.estRows * 0.1; // small CPU cost for filtering
 
+    const sel = estimateSelectivity(node.predicate, stats);
+    return this.makeFilter(childPlan, node.predicate, Math.ceil(childPlan.estRows * sel));
+  }
+
+  /** Access path for a table plus a filter on `predicate` (the AND of `conjuncts`). */
+  private planFilteredScan(scan: LogicalScan, conjuncts: BoundExpression[], predicate?: BoundExpression): PhysicalNode {
+    const access = this.planScan(scan, conjuncts);
+    if (conjuncts.length === 0) return access;
+    const stats = effectiveStats(this.catalog.getTable(scan.tableId).stats);
+    const fullPredicate = predicate ?? andAll(conjuncts);
+    const estRows = Math.min(access.estRows, Math.ceil(stats.rowCount * estimateSelectivity(fullPredicate, stats)));
+    return this.makeFilter(access, fullPredicate, estRows);
+  }
+
+  private makeFilter(child: PhysicalNode, predicate: BoundExpression, estRows: number): PhysFilter {
     return {
       kind: 'phys_filter',
-      child: childPlan,
-      predicate: node.predicate,
+      child,
+      predicate,
       estRows,
-      estCost
-    } as PhysFilter;
+      estCost: child.estCost + child.estRows * 0.1 // small CPU cost for filtering
+    };
+  }
+
+  private planLimit(node: LogicalLimit): PhysicalNode {
+    const childPlan = this.planNode(node.child);
+    return {
+      kind: 'phys_limit',
+      child: childPlan,
+      limit: node.limit,
+      estRows: Math.min(childPlan.estRows, node.limit),
+      estCost: childPlan.estCost
+    } as PhysLimit;
   }
 
   private planProject(node: LogicalProject): PhysicalNode {
-    const childPlan = this.plan(node.child);
+    const childPlan = this.planNode(node.child);
     return {
       kind: 'phys_project',
       child: childPlan,
@@ -160,40 +179,53 @@ export class PhysicalPlanner {
     } as PhysProject;
   }
 
-  private planJoinTree(node: LogicalNode): PhysicalNode {
-    // Collect all joined relations and conditions
-    const scans: JoinNode[] = [];
-    const conditions: BoundExpression[] = [];
+  /**
+   * Plans a tree of inner joins. All ON conditions and `extraConjuncts` (from a
+   * WHERE directly above) are split into conjuncts: single-table ones are pushed
+   * into that table's scan, multi-table ones go to the join where their tables
+   * meet, and table-free ones (e.g. `1 = 0`) stay in a filter on top.
+   */
+  private planJoinTree(node: LogicalNode, extraConjuncts: BoundExpression[]): PhysicalNode {
+    const leaves: LogicalScan[] = [];
+    const conjuncts: BoundExpression[] = [...extraConjuncts];
 
     const collect = (n: LogicalNode) => {
       if (n.kind === 'join') {
         collect(n.left);
         collect(n.right);
-        conditions.push((n as LogicalJoin).condition);
+        conjuncts.push(...splitConjuncts((n as LogicalJoin).condition));
       } else if (n.kind === 'scan') {
-        const physScan = this.planScan(n as LogicalScan);
-        const refName = (n as LogicalScan).alias || (n as LogicalScan).tableId as string;
-        scans.push({
-          node: physScan,
-          tables: new Set([refName]),
-          estRows: physScan.estRows
-        });
+        leaves.push(n);
       } else {
-        // If it's a subquery or filtered scan before join
-        const physNode = this.plan(n);
-        // We'll just assign a generic table name for the set
-        scans.push({
-          node: physNode,
-          tables: new Set(['__subquery__']),
-          estRows: physNode.estRows
-        });
+        throw new Error(`Unsupported join input: ${n.kind}`);
       }
     };
-
     collect(node);
 
+    const pushed = new Map<string, BoundExpression[]>();
+    const joinConditions: BoundExpression[] = [];
+    const topConditions: BoundExpression[] = [];
+    for (const conj of conjuncts) {
+      const refs = tablesReferenced(conj);
+      if (refs.size === 0) {
+        topConditions.push(conj);
+      } else if (refs.size === 1) {
+        const ref = [...refs][0]!;
+        pushed.set(ref, [...(pushed.get(ref) ?? []), conj]);
+      } else {
+        joinConditions.push(conj);
+      }
+    }
+
+    const scans: JoinNode[] = leaves.map(leaf => {
+      const ref = leaf.alias ?? (leaf.tableId as string);
+      const physNode = this.planFilteredScan(leaf, pushed.get(ref) ?? []);
+      return { node: physNode, tables: new Set([ref]), estRows: physNode.estRows };
+    });
+
     const orderer = new JoinOrderer(this.catalog);
-    return orderer.orderJoins(scans, conditions);
+    const joined = orderer.orderJoins(scans, joinConditions);
+    return topConditions.length > 0 ? this.makeFilter(joined, andAll(topConditions), joined.estRows) : joined;
   }
 
   private planInsert(node: LogicalInsert): PhysicalNode {
@@ -208,7 +240,7 @@ export class PhysicalPlanner {
   }
 
   private planDelete(node: LogicalDelete): PhysicalNode {
-    const childPlan = this.plan(node.child);
+    const childPlan = this.planNode(node.child);
     return {
       kind: 'phys_delete',
       tableId: node.tableId,

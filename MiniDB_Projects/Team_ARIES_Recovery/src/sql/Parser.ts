@@ -2,7 +2,7 @@ import { parse } from 'sql-parser-cst';
 import type { 
   Statement, SelectStmt, InsertStmt, DeleteStmt, CreateTableStmt, CreateIndexStmt, DropTableStmt,
   BeginStmt, CommitStmt, AbortStmt, ExplainStmt, AnalyzeStmt, ShowStmt,
-  Expression, Projection, TableRef, JoinClause, ColumnDefAST, Literal
+  Expression, Projection, TableRef, JoinClause, ColumnDefAST, Literal, BinaryExpr
 } from './AST.js';
 
 export interface CstNode {
@@ -33,6 +33,8 @@ export interface CstNode {
   queryPlanKw?: CstNode;
   stmt?: CstNode;
   count?: CstNode;
+  offset?: CstNode;
+  modifiers?: CstNode[];
 }
 
 export function parseSQL(sql: string): Statement {
@@ -71,6 +73,10 @@ function transformStatement(stmt: CstNode): Statement {
     case 'rollback_stmt': return { kind: 'abort' };
     case 'explain_stmt': return transformExplain(stmt);
     case 'analyze_stmt': return transformAnalyze(stmt);
+    case 'update_stmt':
+      throw new Error('UPDATE is not supported; use DELETE then INSERT');
+    case 'compound_select_stmt':
+      throw new Error(`${operatorName(stmt.operator)} is not supported`);
     // Show is not native to sqlite CST, they might parse as arbitrary or we can intercept them
     default:
       // Try custom parsing for SHOW if sql-parser-cst doesn't support them well
@@ -85,20 +91,28 @@ function transformSelect(stmt: CstNode): SelectStmt {
   let whereClause = stmt.clauses?.find((c: CstNode) => c.type === 'where_clause');
   let limitClause = stmt.clauses?.find((c: CstNode) => c.type === 'limit_clause');
 
+  for (const clause of stmt.clauses ?? []) {
+    if (!SELECT_CLAUSES.has(clause.type)) throw new Error(`${clauseLabel(clause.type)} is not supported`);
+  }
+
   if (!selectClause || !fromClause) {
     throw new Error('SELECT must have SELECT and FROM clauses');
   }
 
+  for (const modifier of selectClause.modifiers ?? []) {
+    if (modifier.type === 'select_distinct') throw new Error('DISTINCT is not supported');
+    if (modifier.type !== 'select_all') throw new Error(`SELECT modifier ${modifier.type} is not supported`);
+  }
+
   const projections = selectClause.columns!.items!.map(transformProjection);
-  
+
   // From clause handles the primary table and joins
   let primaryTableNode = fromClause.expr!;
-  // If it's a list (e.g. FROM a, b), we only support single table / explicit joins for now
   if (primaryTableNode.type === 'list_expr') {
-    primaryTableNode = primaryTableNode.items![0]!;
+    throw new Error('Comma joins (FROM a, b) are not supported; use JOIN ... ON');
   }
   let joins: JoinClause[] = [];
-  
+
   if (primaryTableNode.type === 'join_expr') {
     // Unroll join_expr
     let current = primaryTableNode;
@@ -107,39 +121,43 @@ function transformSelect(stmt: CstNode): SelectStmt {
       joinStack.push(current);
       current = current.left!;
     }
-    
+
     primaryTableNode = current;
-    
+
     // Process joins in order
     while (joinStack.length > 0) {
       const joinNode = joinStack.pop()!;
-      const right = joinNode.right!;
-      let joinTable = right.type === 'alias' ? (right.expr as CstNode).name as string : right.name as string;
-      let joinAlias = right.type === 'alias' ? (right.alias as CstNode).name as string : undefined;
-      
+      const joinOp = operatorName(joinNode.operator);
+      if (joinOp === ',') {
+        throw new Error('Comma joins (FROM a, b) are not supported; use JOIN ... ON');
+      }
+      if (joinOp !== 'JOIN' && joinOp !== 'INNER JOIN') {
+        throw new Error(`${joinOp} is not supported; only INNER JOIN ... ON is supported`);
+      }
+      const right = transformTableRef(joinNode.right!);
+
       let onExpr: Expression;
       if (joinNode.specification && joinNode.specification.type === 'join_on_specification') {
         onExpr = transformExpr(joinNode.specification.expr!);
+      } else if (joinNode.specification) {
+        throw new Error('JOIN ... USING is not supported; use JOIN ... ON');
       } else {
-        throw new Error('INNER JOIN must have ON condition');
+        throw new Error('JOIN must have an ON condition');
       }
-      
+
       const joinClause: JoinClause = {
-        table: joinTable,
+        table: right.table,
         on: onExpr
       };
-      if (joinAlias) joinClause.alias = joinAlias;
+      if (right.alias) joinClause.alias = right.alias;
       joins.push(joinClause);
     }
   }
 
-  const tableRef: TableRef = {
-    table: primaryTableNode.type === 'alias' ? (primaryTableNode.expr!.name! as string) : (primaryTableNode.name! as string)
-  };
-  if (primaryTableNode.type === 'alias') tableRef.alias = primaryTableNode.alias!.name! as string;
+  const tableRef = transformTableRef(primaryTableNode);
 
   const where = whereClause ? transformExpr(whereClause.expr!) : undefined;
-  const limit = limitClause ? limitClause.count!.value as number : undefined;
+  const limit = limitClause ? transformLimit(limitClause) : undefined;
 
   const result: SelectStmt = {
     kind: 'select',
@@ -152,27 +170,74 @@ function transformSelect(stmt: CstNode): SelectStmt {
   return result;
 }
 
+const SELECT_CLAUSES = new Set(['select_clause', 'from_clause', 'where_clause', 'limit_clause']);
+const AGGREGATES = new Set(['COUNT', 'SUM', 'AVG', 'MIN', 'MAX', 'TOTAL', 'GROUP_CONCAT']);
+const ARITHMETIC_OPS = new Set(['+', '-', '*', '/', '%', '||']);
+const COMPARISON_OPS: Record<string, BinaryExpr['op']> = {
+  '=': '=', '==': '=', '!=': '!=', '<>': '!=',
+  '<': '<', '<=': '<=', '>': '>', '>=': '>=', 'LIKE': 'LIKE',
+};
+
+function clauseLabel(type: string): string {
+  return type.replace(/_clause$/, '').replace(/_/g, ' ').toUpperCase();
+}
+
+/** sql-parser-cst gives operators as a string, a keyword node, or a list of keywords. */
+function operatorName(op: unknown): string {
+  if (typeof op === 'string') return op.toUpperCase();
+  if (Array.isArray(op)) return op.map(operatorName).join(' ');
+  if (op && typeof op === 'object' && 'name' in op) return String((op as { name: unknown }).name).toUpperCase();
+  return 'UNKNOWN';
+}
+
+function transformTableRef(node: CstNode): TableRef {
+  if (node.type === 'identifier') return { table: node.name as string };
+  if (node.type === 'alias' && node.expr?.type === 'identifier') {
+    return { table: node.expr.name as string, alias: node.alias!.name as string };
+  }
+  const inner = node.type === 'alias' ? node.expr! : node;
+  if (inner.type === 'paren_expr') throw new Error('Subqueries are not supported');
+  throw new Error(`Unsupported table reference: ${inner.type}`);
+}
+
+function transformLimit(clause: CstNode): number {
+  if (clause.offset) throw new Error('OFFSET is not supported');
+  const count = clause.count;
+  const value = count?.type === 'number_literal' ? count.value : undefined;
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
+    throw new Error('LIMIT must be a non-negative integer');
+  }
+  return value;
+}
+
 function transformProjection(col: CstNode): Projection {
-  if (col.type === 'star') {
+  if (col.type === 'star' || col.type === 'all_columns') {
     return { kind: 'star' };
   }
-  
-  let expr = col.expr || col;
-  let alias = col.alias ? col.alias.name! as string : undefined;
-  
+
+  const expr = col.type === 'alias' ? col.expr! : col;
+  const alias = col.type === 'alias' ? col.alias!.name as string : undefined;
+
   if (expr.type === 'identifier') {
     const proj: Projection = { kind: 'col', column: expr.name! as string };
     if (alias) proj.alias = alias;
     return proj;
   } else if (expr.type === 'member_expr') {
+    if (expr.property!.type === 'all_columns') {
+      return { kind: 'star', table: expr.object!.name as string };
+    }
     const proj: Projection = { kind: 'col', tableAlias: expr.object!.name! as string, column: expr.property!.name! as string };
     if (alias) proj.alias = alias;
     return proj;
-  } else if (expr.type === 'all_columns') {
-    return { kind: 'star' };
+  } else if (expr.type === 'func_call') {
+    const fn = operatorName(expr.name);
+    if (AGGREGATES.has(fn)) throw new Error(`Aggregate functions such as ${fn}() are not supported`);
+    throw new Error(`Function calls such as ${fn}() are not supported`);
+  } else if (expr.type === 'binary_expr' && ARITHMETIC_OPS.has(operatorName(expr.operator))) {
+    throw new Error('Arithmetic expressions are not supported in SELECT');
   }
-  
-  throw new Error(`Unsupported projection: ${expr.type}`);
+
+  throw new Error(`Only column names are supported in SELECT (got ${expr.type})`);
 }
 
 function transformInsert(stmt: CstNode): InsertStmt {
@@ -207,8 +272,17 @@ function transformDelete(stmt: CstNode): DeleteStmt {
   let whereClause = stmt.clauses?.find((c: CstNode) => c.type === 'where_clause');
 
   if (!deleteClause) throw new Error('DELETE must have FROM');
+  for (const clause of stmt.clauses ?? []) {
+    if (clause.type !== 'delete_clause' && clause.type !== 'where_clause') {
+      throw new Error(`${clauseLabel(clause.type)} is not supported in DELETE`);
+    }
+  }
 
-  const table = (deleteClause.tables as CstNode).items![0]!.name as string;
+  const tables = (deleteClause.tables as CstNode).items!;
+  if (tables.length !== 1) throw new Error('DELETE supports exactly one table');
+  const tableRef = transformTableRef(tables[0]!);
+  if (tableRef.alias) throw new Error('Table aliases are not supported in DELETE');
+  const table = tableRef.table;
   const where = whereClause ? transformExpr(whereClause.expr!) : undefined;
 
   const result: DeleteStmt = {
@@ -305,23 +379,48 @@ function transformAnalyze(stmt: CstNode): AnalyzeStmt {
 
 function transformExpr(expr: CstNode): Expression {
   switch (expr.type) {
-    case 'binary_expr':
-      const op = typeof expr.operator === 'string' ? expr.operator.toUpperCase() : 'UNKNOWN';
-      if (['AND', 'OR'].includes(op)) {
+    case 'binary_expr': {
+      const op = operatorName(expr.operator);
+      if (op === 'AND' || op === 'OR') {
         return {
           kind: 'logical',
-          op: op as 'AND' | 'OR',
-          left: transformExpr(expr.left!),
-          right: transformExpr(expr.right!)
-        };
-      } else {
-        return {
-          kind: 'binary',
-          op: op as '=' | '!=' | '<' | '>' | '<=' | '>=' | 'LIKE',
+          op,
           left: transformExpr(expr.left!),
           right: transformExpr(expr.right!)
         };
       }
+      const comparison = COMPARISON_OPS[op];
+      if (!comparison) {
+        if (ARITHMETIC_OPS.has(op)) throw new Error('Arithmetic expressions are not supported');
+        throw new Error(`Operator ${op} is not supported`);
+      }
+      return {
+        kind: 'binary',
+        op: comparison,
+        left: transformExpr(expr.left!),
+        right: transformExpr(expr.right!)
+      };
+    }
+    case 'paren_expr': {
+      const inner = expr.expr!;
+      if (inner.type === 'select_stmt' || inner.type === 'compound_select_stmt') {
+        throw new Error('Subqueries are not supported');
+      }
+      return transformExpr(inner);
+    }
+    case 'prefix_op_expr': {
+      const op = operatorName(expr.operator);
+      const inner = expr.expr!;
+      if ((op === '-' || op === '+') && inner.type === 'number_literal') {
+        const value = inner.value as number;
+        return { kind: 'literal', value: op === '-' ? -value : value };
+      }
+      throw new Error(`Operator ${op} is not supported`);
+    }
+    case 'between_expr':
+      throw new Error('BETWEEN is not supported; use col >= a AND col <= b');
+    case 'func_call':
+      throw new Error(`Function calls such as ${operatorName(expr.name)}() are not supported`);
     case 'identifier':
       return { kind: 'column_ref', column: expr.name as string };
     case 'member_expr':

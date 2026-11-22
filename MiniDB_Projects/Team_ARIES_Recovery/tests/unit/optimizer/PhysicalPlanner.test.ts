@@ -76,6 +76,34 @@ describe('PhysicalPlanner & Explain', () => {
     expect(explain).toContain('rows=~1');
   });
 
+  it('uses the index for one conjunct of an AND and keeps the full predicate on top', () => {
+    const logicalPlan = new Binder(catalog).bind(parseSQL('SELECT * FROM users WHERE age > 20 AND id = 42'));
+    const physicalPlan = new PhysicalPlanner(catalog).plan(logicalPlan) as any;
+
+    expect(physicalPlan.kind).toBe('phys_project');
+    const filter = physicalPlan.child;
+    expect(filter.kind).toBe('phys_filter');
+    expect(filter.predicate.kind).toBe('bound_logical');
+    expect(filter.child.kind).toBe('phys_index_scan');
+    expect(filter.child.lowKey).toBe(42);
+    expect(filter.child.highKey).toBe(42);
+  });
+
+  it('intersects range conjuncts on the indexed column', () => {
+    const logicalPlan = new Binder(catalog).bind(parseSQL('SELECT * FROM users WHERE id > 10 AND 20 >= id AND id >= 12'));
+    const scan = (new PhysicalPlanner(catalog).plan(logicalPlan) as any).child.child;
+    expect(scan.kind).toBe('phys_index_scan');
+    expect(scan.lowKey).toBe(12);
+    expect(scan.highKey).toBe(20);
+  });
+
+  it('never uses the index for != or LIKE', () => {
+    for (const where of ['id != 42', 'id <> 42', "name LIKE 'a%'"]) {
+      const logicalPlan = new Binder(catalog).bind(parseSQL(`SELECT * FROM users WHERE ${where}`));
+      expect(explainTree(new PhysicalPlanner(catalog).plan(logicalPlan))).not.toContain('phys_index_scan');
+    }
+  });
+
   it('plans a SeqScan when no index is available', () => {
     const ast = parseSQL('SELECT * FROM users WHERE age = 42');
     const binder = new Binder(catalog);
@@ -99,6 +127,28 @@ describe('PhysicalPlanner & Explain', () => {
     
     const explain = explainTree(physicalPlan);
     expect(explain).toContain('phys_nlj');
+  });
+
+  it('resolves join columns to their offset in the joined row without touching the logical plan', () => {
+    const logicalPlan = new Binder(catalog).bind(
+      parseSQL('SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id WHERE u.id = 7'));
+    const before = JSON.stringify(logicalPlan);
+    const project = new PhysicalPlanner(catalog).plan(logicalPlan) as any;
+    expect(JSON.stringify(logicalPlan)).toBe(before);
+
+    const join = project.child;
+    expect(join.kind).toBe('phys_nlj');
+    // The WHERE conjunct is pushed into the users side, not left above the join.
+    const usersSide = [join.left, join.right].find((n: any) => n.kind === 'phys_filter');
+    expect(usersSide.child.kind).toBe('phys_index_scan');
+
+    const usersFirst = join.left === usersSide;
+    const usersOffset = usersFirst ? 0 : 3;
+    const ordersOffset = usersFirst ? 3 : 0;
+    expect(project.projections.map((p: any) => p.columnIndex)).toEqual([usersOffset + 1, ordersOffset + 2]);
+    const cols = [join.condition.left, join.condition.right];
+    expect(cols.find((c: any) => c.columnName === 'id').columnIndex).toBe(usersOffset + 0);
+    expect(cols.find((c: any) => c.columnName === 'user_id').columnIndex).toBe(ordersOffset + 1);
   });
 
   it('can explain an analyze statement logic flow', () => {

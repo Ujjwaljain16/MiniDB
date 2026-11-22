@@ -5,6 +5,7 @@ export type LogicalNode =
   | LogicalFilter
   | LogicalProject
   | LogicalJoin
+  | LogicalLimit
   | LogicalInsert
   | LogicalDelete;
 
@@ -25,6 +26,12 @@ export interface LogicalProject {
   kind: 'project';
   child: LogicalNode;
   projections: BoundExpression[];
+}
+
+export interface LogicalLimit {
+  kind: 'limit';
+  child: LogicalNode;
+  limit: number;
 }
 
 export interface LogicalJoin {
@@ -101,6 +108,10 @@ export function prettyPrint(plan: LogicalNode, indent: number = 0): string {
       return `${pad}LogicalProject\n${pad}  columns: [${cols}]\n${prettyPrint(plan.child, indent + 4)}`;
     case 'join':
       return `${pad}LogicalJoin (${plan.joinType})\n${pad}  condition: ${prettyExpr(plan.condition)}\n${prettyPrint(plan.left, indent + 4)}\n${prettyPrint(plan.right, indent + 4)}`;
+    case 'limit':
+      return `${pad}LogicalLimit
+${pad}  limit: ${plan.limit}
+${prettyPrint(plan.child, indent + 4)}`;
     case 'insert':
       return `${pad}LogicalInsert\n${pad}  table: ${plan.tableId}\n${pad}  columns: [${plan.columns.join(', ')}]`;
     case 'delete':

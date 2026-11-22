@@ -1,5 +1,5 @@
 import type { ICatalog, CatalogEntry } from '../common/interfaces.js';
-import type { TableId } from '../common/types.js';
+import type { TableId, ColumnDef } from '../common/types.js';
 import type { 
   Statement, Expression, Projection, SelectStmt, InsertStmt, DeleteStmt
 } from './AST.js';
@@ -107,8 +107,12 @@ export class Binder {
     const boundProjections: BoundExpression[] = [];
     for (const proj of stmt.projections) {
       if (proj.kind === 'star') {
-        // Expand star to all columns in scope
+        if (proj.table && !scope.tables.has(proj.table)) {
+          throw new BindError(`Table or alias '${proj.table}' not found`);
+        }
+        // Expand star to all columns in scope (or of the one table named in `t.*`)
         for (const [refName, { entry }] of scope.tables.entries()) {
+          if (proj.table && proj.table !== refName) continue;
           for (let i = 0; i < entry.schema.length; i++) {
             const col = entry.schema[i]!;
             const boundCol: BoundColumnRef = {
@@ -135,6 +139,10 @@ export class Binder {
       projections: boundProjections
     };
 
+    if (stmt.limit !== undefined) {
+      plan = { kind: 'limit', child: plan, limit: stmt.limit };
+    }
+
     return plan;
   }
 
@@ -148,21 +156,31 @@ export class Binder {
     for (const colName of cols) {
       const idx = entry.schema.findIndex(c => c.name === colName);
       if (idx === -1) throw new BindError(`Column '${colName}' not found in table '${stmt.table}'`);
+      if (colIndices.includes(idx)) throw new BindError(`Column '${colName}' is listed more than once`);
       colIndices.push(idx);
     }
-    
+
+    // Rows are bound in table column order, since InsertOp stores them as-is.
     const boundValues: BoundExpression[][] = [];
     for (const row of stmt.values) {
       if (row.length !== cols.length) {
         throw new BindError(`INSERT has ${row.length} values but ${cols.length} columns`);
       }
-      
-      const boundRow = row.map((val, i) => {
+
+      const boundRow: BoundExpression[] = entry.schema.map(() => ({ kind: 'bound_literal', value: null, type: 'UNKNOWN' }));
+      row.forEach((val, i) => {
         const boundVal = this.bindExpression(val, { tables: new Map() }); // no scope for literals
         const expectedType = entry.schema[colIndices[i]!]!.type;
         // Strict type checking for inserts
         this.checkType(boundVal, expectedType);
-        return boundVal;
+        this.checkFits(entry.schema[colIndices[i]!]!, boundVal);
+        boundRow[colIndices[i]!] = boundVal;
+      });
+      entry.schema.forEach((col, i) => {
+        const val = boundRow[i]!;
+        if (!col.nullable && val.kind === 'bound_literal' && val.value === null) {
+          throw new BindError(`Column '${col.name}' cannot be NULL`);
+        }
       });
       boundValues.push(boundRow);
     }
@@ -170,7 +188,7 @@ export class Binder {
     return {
       kind: 'insert',
       tableId: entry.tableId,
-      columns: stmt.columns,
+      columns: entry.schema.map(c => c.name),
       values: boundValues
     };
   }
@@ -298,6 +316,18 @@ export class Binder {
     if (typeof val === 'string') return 'VARCHAR';
     if (typeof val === 'boolean') return 'BOOL';
     return 'UNKNOWN'; // NULL
+  }
+
+  /** Values that don't fit the column's on-disk size would be rejected or overflow the index key slot. */
+  private checkFits(col: ColumnDef, expr: BoundExpression) {
+    if (expr.kind !== 'bound_literal' || expr.value === null) return;
+    if (col.type === 'INT' && typeof expr.value === 'number' && (expr.value < -2147483648 || expr.value > 2147483647)) {
+      throw new TypeError(`Value ${expr.value} is out of range for INT column '${col.name}'`);
+    }
+    const maxLen = col.maxLen ?? 255;
+    if (col.type === 'VARCHAR' && Buffer.byteLength(String(expr.value), 'utf8') > maxLen) {
+      throw new TypeError(`Value for '${col.name}' is longer than VARCHAR(${maxLen})`);
+    }
   }
 
   private checkType(expr: BoundExpression, expected: string) {

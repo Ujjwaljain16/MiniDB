@@ -70,7 +70,12 @@ export class BPlusTree implements IBPlusTree {
     }
   }
 
-  async *searchRange(low: ColValue, high: ColValue): AsyncIterableIterator<RID> {
+  /**
+   * Yields RIDs with `low <= key <= high` in key order. A null bound is open:
+   * null `low` starts at the leftmost leaf, null `high` runs to the last leaf.
+   * Stopping the iterator early (return()) unpins the leaf it was on.
+   */
+  async *searchRange(low: ColValue | null, high: ColValue | null): AsyncIterableIterator<RID> {
     if (this._rootPageId === NULL_PAGE_ID) return;
 
     let pageId = this._rootPageId;
@@ -79,10 +84,10 @@ export class BPlusTree implements IBPlusTree {
     try {
       while (true) {
         currentNode = await this.fetchNode(pageId);
-        
+
         if (currentNode.isLeaf) break;
-        
-        const childIdx = currentNode.findChildIndex(low);
+
+        const childIdx = low === null ? 0 : this.lowerBoundChild(currentNode, low);
         const childId = currentNode.getChildId(childIdx);
         this.bufferPool.unpinPage(pageId, false);
         currentNode = null;
@@ -92,18 +97,16 @@ export class BPlusTree implements IBPlusTree {
       while (pageId !== NULL_PAGE_ID && currentNode) {
         const n = currentNode.numKeys;
         let done = false;
-        
+
         for (let i = 0; i < n; i++) {
           const { key, rid } = currentNode.getLeafEntry(i);
-          const cmpLow = compareKeys(key, low, this.colDef);
-          const cmpHigh = compareKeys(key, high, this.colDef);
-          
-          if (cmpHigh > 0) {
+
+          if (high !== null && compareKeys(key, high, this.colDef) > 0) {
             done = true;
             break;
           }
-          
-          if (cmpLow >= 0) {
+
+          if (low === null || compareKeys(key, low, this.colDef) >= 0) {
             yield rid;
           }
         }
@@ -130,7 +133,70 @@ export class BPlusTree implements IBPlusTree {
     }
   }
 
+  /**
+   * Snapshot of every node, breadth-first from the root, for visualisation.
+   * Leaves have no children; internal nodes have nextLeafId = -1.
+   */
+  async describe(): Promise<{
+    rootPageId: number;
+    height: number;
+    nodes: Array<{ pageId: number; isLeaf: boolean; keys: (number | string | boolean | null)[]; children: number[]; nextLeafId: number }>;
+  }> {
+    const nodes: Array<{ pageId: number; isLeaf: boolean; keys: (number | string | boolean | null)[]; children: number[]; nextLeafId: number }> = [];
+    let height = 0;
+    let level: PageId[] = this._rootPageId === NULL_PAGE_ID ? [] : [this._rootPageId];
+
+    while (level.length > 0) {
+      height++;
+      const nextLevel: PageId[] = [];
+      for (const pageId of level) {
+        const node = await this.fetchNode(pageId);
+        try {
+          const keys: (number | string | boolean | null)[] = [];
+          const children: number[] = [];
+          for (let i = 0; i < node.numKeys; i++) {
+            const key = node.isLeaf ? node.getLeafEntry(i).key : node.getInternalKey(i);
+            keys.push(typeof key === 'bigint' ? key.toString() : key);
+          }
+          if (!node.isLeaf) {
+            for (let i = 0; i <= node.numKeys; i++) children.push(node.getChildId(i));
+            nextLevel.push(...(children as PageId[]));
+          }
+          nodes.push({
+            pageId,
+            isLeaf: node.isLeaf,
+            keys,
+            children,
+            nextLeafId: node.isLeaf ? node.nextLeafId : NULL_PAGE_ID,
+          });
+        } finally {
+          this.bufferPool.unpinPage(pageId, false);
+        }
+      }
+      level = nextLevel;
+    }
+
+    return { rootPageId: this._rootPageId, height, nodes };
+  }
+
+  /**
+   * First child that can hold `key`. Unlike findChildIndex this goes left on a
+   * separator equal to `key`, because a leaf split can leave duplicates of the
+   * separator at the end of the left sibling.
+   */
+  private lowerBoundChild(node: BPlusNode, key: ColValue): number {
+    let lo = 0;
+    let hi = node.numKeys;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (compareKeys(key, node.getInternalKey(mid), this.colDef) <= 0) hi = mid;
+      else lo = mid + 1;
+    }
+    return lo;
+  }
+
   async insert(key: ColValue, rid: RID): Promise<void> {
+    key = this.storedKey(key);
     if (this._rootPageId === NULL_PAGE_ID) {
       // Create new root leaf node
       const [newId, buf] = await this.bufferPool.newPage();
@@ -297,33 +363,18 @@ export class BPlusTree implements IBPlusTree {
     await this.insertIntoParent(parent.pageId, splitKey, rightParent.pageId, parentPath);
   }
 
-  async delete(key: ColValue): Promise<void> {
+  /**
+   * Remove the entry for `key`. With duplicate keys, pass the row's `rid` so
+   * the entry of that row (not just any row with the same key) is removed.
+   */
+  async delete(key: ColValue, rid?: RID): Promise<void> {
     if (this._rootPageId === NULL_PAGE_ID) return;
 
-    const parentPath: BPlusNode[] = [];
-    let pageId = this._rootPageId;
-    let leafNode: BPlusNode;
+    const found = await this.findLeafEntry(this._rootPageId, this.storedKey(key), rid, []);
+    if (!found) return; // Key not found
+    const { leaf: leafNode, index, path: parentPath } = found;
 
-    // 1. Descend to correct leaf
-    while (true) {
-      const node = await this.fetchNode(pageId);
-      if (node.isLeaf) {
-        leafNode = node;
-        break;
-      }
-      parentPath.push(node);
-      const childIdx = node.findChildIndex(key);
-      pageId = node.getChildId(childIdx);
-    }
-
-    // Delete the entry
-    const deleted = leafNode.deleteLeafEntry(key);
-    if (!deleted) {
-      // Key not found
-      this.bufferPool.unpinPage(leafNode.pageId, false);
-      for (const p of parentPath) this.bufferPool.unpinPage(p.pageId, false);
-      return;
-    }
+    this.removeLeafEntryAt(leafNode, index);
 
     // Check underflow
     const minKeys = Math.ceil((leafNode.maxLeafEntries - 1) / 2);
@@ -336,6 +387,60 @@ export class BPlusTree implements IBPlusTree {
     // Handle underflow
     this.bufferPool.unpinPage(leafNode.pageId, true);
     await this.handleUnderflow(leafNode.pageId, parentPath);
+  }
+
+  /**
+   * Find the leaf entry for (key, rid), trying every child whose range can hold
+   * `key` since duplicates may span several leaves. On success the leaf and
+   * the returned path stay pinned, as delete's underflow handling expects.
+   */
+  private async findLeafEntry(
+    pageId: PageId, key: ColValue, rid: RID | undefined, path: BPlusNode[]
+  ): Promise<{ leaf: BPlusNode; index: number; path: BPlusNode[] } | null> {
+    const node = await this.fetchNode(pageId);
+    if (node.isLeaf) {
+      for (let i = 0; i < node.numKeys; i++) {
+        const entry = node.getLeafEntry(i);
+        const cmp = compareKeys(entry.key, key, this.colDef);
+        if (cmp > 0) break;
+        if (cmp === 0 && (!rid || (entry.rid.pageId === rid.pageId && entry.rid.slotId === rid.slotId))) {
+          return { leaf: node, index: i, path };
+        }
+      }
+      this.bufferPool.unpinPage(pageId, false);
+      return null;
+    }
+
+    const last = node.findChildIndex(key);
+    for (let i = this.lowerBoundChild(node, key); i <= last; i++) {
+      const found = await this.findLeafEntry(node.getChildId(i), key, rid, [...path, node]);
+      if (found) return found;
+    }
+    this.bufferPool.unpinPage(pageId, false);
+    return null;
+  }
+
+  /** BPlusNode can only delete the first entry with a key, so swap the target into that slot first. */
+  private removeLeafEntryAt(node: BPlusNode, index: number): void {
+    const { key, rid } = node.getLeafEntry(index);
+    let first = index;
+    while (first > 0 && compareKeys(node.getLeafEntry(first - 1).key, key, this.colDef) === 0) first--;
+    if (first !== index) {
+      node.setLeafEntry(index, key, node.getLeafEntry(first).rid);
+      node.setLeafEntry(first, key, rid);
+    }
+    node.deleteLeafEntry(key);
+  }
+
+  /** NULL keys are written to the page as zero bytes, so order and match them as that value. */
+  private storedKey(key: ColValue): ColValue {
+    if (key !== null) return key;
+    switch (this.colDef.type) {
+      case 'VARCHAR': return '';
+      case 'BOOL': return false;
+      case 'BIGINT': return 0n;
+      default: return 0;
+    }
   }
 
   private async handleUnderflow(pageId: PageId, parentPath: BPlusNode[]): Promise<void> {
@@ -382,7 +487,7 @@ export class BPlusTree implements IBPlusTree {
         // Borrow
         if (isLeaf) {
           const entry = leftSibling.getLeafEntry(leftSibling.numKeys - 1);
-          leftSibling.deleteLeafEntry(entry.key);
+          this.removeLeafEntryAt(leftSibling, leftSibling.numKeys - 1);
           node.insertLeafEntry(entry.key, entry.rid);
           parent.setInternalKey(myIdx - 1, node.getLeafEntry(0).key);
         } else {

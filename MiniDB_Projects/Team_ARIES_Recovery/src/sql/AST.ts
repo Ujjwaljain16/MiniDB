@@ -112,7 +112,7 @@ export interface Literal {
 }
 
 export type Projection =
-  | { kind: 'star' }
+  | { kind: 'star'; table?: string }
   | { kind: 'col'; tableAlias?: string; column: string; alias?: string };
 
 export interface TableRef {

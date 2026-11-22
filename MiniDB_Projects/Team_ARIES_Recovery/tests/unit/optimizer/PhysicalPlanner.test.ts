@@ -129,6 +129,28 @@ describe('PhysicalPlanner & Explain', () => {
     expect(explain).toContain('phys_nlj');
   });
 
+  it('resolves join columns to their offset in the joined row without touching the logical plan', () => {
+    const logicalPlan = new Binder(catalog).bind(
+      parseSQL('SELECT u.name, o.amount FROM users u JOIN orders o ON u.id = o.user_id WHERE u.id = 7'));
+    const before = JSON.stringify(logicalPlan);
+    const project = new PhysicalPlanner(catalog).plan(logicalPlan) as any;
+    expect(JSON.stringify(logicalPlan)).toBe(before);
+
+    const join = project.child;
+    expect(join.kind).toBe('phys_nlj');
+    // The WHERE conjunct is pushed into the users side, not left above the join.
+    const usersSide = [join.left, join.right].find((n: any) => n.kind === 'phys_filter');
+    expect(usersSide.child.kind).toBe('phys_index_scan');
+
+    const usersFirst = join.left === usersSide;
+    const usersOffset = usersFirst ? 0 : 3;
+    const ordersOffset = usersFirst ? 3 : 0;
+    expect(project.projections.map((p: any) => p.columnIndex)).toEqual([usersOffset + 1, ordersOffset + 2]);
+    const cols = [join.condition.left, join.condition.right];
+    expect(cols.find((c: any) => c.columnName === 'id').columnIndex).toBe(usersOffset + 0);
+    expect(cols.find((c: any) => c.columnName === 'user_id').columnIndex).toBe(ordersOffset + 1);
+  });
+
   it('can explain an analyze statement logic flow', () => {
     const ast = parseSQL('ANALYZE users');
     expect(ast.kind).toBe('analyze');

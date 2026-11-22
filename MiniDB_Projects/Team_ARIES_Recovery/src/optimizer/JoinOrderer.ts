@@ -1,6 +1,7 @@
 import type { PhysicalNode, PhysNLJ } from './PhysicalPlan.js';
 import type { BoundExpression } from '../sql/LogicalPlan.js';
 import type { ICatalog } from '../common/interfaces.js';
+import { andAll, tablesReferenced } from './Predicates.js';
 
 export interface JoinNode {
   node: PhysicalNode;
@@ -95,22 +96,11 @@ export class JoinOrderer {
   }
 
   private buildJoin(left: JoinNode, right: JoinNode, conditions: BoundExpression[]): PhysicalNode {
-    // Find applicable conditions between left.tables and right.tables
-    // For now, assume a Cartesian product if no condition found, or use the first applicable one.
-    // In a real system, we'd extract all applicable conditions and AND them.
-    // Here we just pick any applicable condition.
-    
-    let applicableCond: BoundExpression | undefined;
-    for (const cond of conditions) {
-      if (this.isConditionApplicable(cond, left.tables, right.tables)) {
-        applicableCond = cond;
-        break; // Just take the first one for simplicity in this demo
-      }
-    }
+    const applicable = conditions.filter(c => this.isConditionApplicable(c, left.tables, right.tables));
 
-    // Default selectivity for join
-    let joinSelectivity = 0.1; 
-    
+    // Default selectivity for a join with a condition; a cross join keeps every pair.
+    const joinSelectivity = applicable.length > 0 ? 0.1 : 1.0;
+
     const estRows = Math.round(left.estRows * right.estRows * joinSelectivity);
     // Cost of NLJ = left.cost + (left.rows * right.cost)
     // Wait, cost is usually IO cost. 
@@ -122,7 +112,7 @@ export class JoinOrderer {
       kind: 'phys_nlj',
       left: left.node,
       right: right.node,
-      condition: applicableCond || {
+      condition: applicable.length > 0 ? andAll(applicable) : {
         kind: 'bound_literal',
         value: true,
         type: 'BOOL'
@@ -134,20 +124,16 @@ export class JoinOrderer {
     return nlj;
   }
 
+  /**
+   * A condition belongs to the join where all its tables first meet: every
+   * table it reads is available, and it reads from both sides. In a left-deep
+   * tree that places each multi-table condition at exactly one join.
+   */
   private isConditionApplicable(cond: BoundExpression, leftTables: Set<string>, rightTables: Set<string>): boolean {
-    if (cond.kind === 'bound_binary') {
-      const l = cond.left;
-      const r = cond.right;
-      if (l.kind === 'bound_col' && r.kind === 'bound_col') {
-        const lTable = l.tableAlias || l.tableId as string;
-        const rTable = r.tableAlias || r.tableId as string;
-        if ((leftTables.has(lTable) && rightTables.has(rTable)) ||
-            (leftTables.has(rTable) && rightTables.has(lTable))) {
-          return true;
-        }
-      }
-    }
-    return false;
+    const refs = [...tablesReferenced(cond)];
+    return refs.every(t => leftTables.has(t) || rightTables.has(t)) &&
+      refs.some(t => leftTables.has(t)) &&
+      refs.some(t => rightTables.has(t));
   }
 
   private getPermutations<T>(arr: T[]): T[][] {

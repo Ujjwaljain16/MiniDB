@@ -6,6 +6,21 @@ export function columnRef(col: BoundColumnRef): string {
   return col.tableAlias ?? (col.tableId as string);
 }
 
+/** Every table (by alias or id) an expression reads a column from. */
+export function tablesReferenced(expr: BoundExpression, out: Set<string> = new Set()): Set<string> {
+  switch (expr.kind) {
+    case 'bound_col':
+      out.add(columnRef(expr));
+      break;
+    case 'bound_binary':
+    case 'bound_logical':
+      tablesReferenced(expr.left, out);
+      tablesReferenced(expr.right, out);
+      break;
+  }
+  return out;
+}
+
 /** Flatten nested ANDs into their conjuncts. */
 export function splitConjuncts(pred: BoundExpression): BoundExpression[] {
   if (pred.kind === 'bound_logical' && pred.op === 'AND') {

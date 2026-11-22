@@ -98,6 +98,53 @@ describe('SQL correctness', () => {
     });
   });
 
+  describe('self-joins', () => {
+    const pairs = (res: { rows: unknown[][] }) =>
+      res.rows.map(r => r.join('|')).sort();
+
+    it('returns the right rows for a join on different columns', async () => {
+      const rows = await loadUsers(3000);
+      const started = Date.now();
+      const res = await db.execute('SELECT u1.id, u2.id FROM users u1 JOIN users u2 ON u1.id = u2.age WHERE u1.id = 25');
+      expect(Date.now() - started).toBeLessThan(5000);
+      const expected = rows.filter(r => r.age === 25).map(r => `25|${r.id}`).sort();
+      expect(expected.length).toBe(75);
+      expect(pairs(res)).toEqual(expected);
+    });
+
+    it('reads the right columns when the join orderer puts the second table first', async () => {
+      const rows = await loadUsers(400);
+      const res = await db.execute('SELECT a.id, b.name, a.age FROM users a JOIN users b ON a.age = b.id WHERE b.id = 30');
+      const expected = rows.filter(r => r.age === 30).map(r => `${r.id}|u30|30`).sort();
+      expect(expected.length).toBeGreaterThan(0);
+      expect(pairs(res)).toEqual(expected);
+    });
+
+    it('applies every conjunct of an ON clause', async () => {
+      const rows = await loadUsers(200);
+      // Without the second conjunct this would pair each row with every row of the same age.
+      const res = await db.execute('SELECT a.id, b.id FROM users a JOIN users b ON a.age = b.age AND a.id = b.id');
+      expect(pairs(res)).toEqual(rows.map(r => `${r.id}|${r.id}`).sort());
+    });
+
+    it('handles three-way joins and WHERE conjuncts on several tables', async () => {
+      const rows = await loadUsers(300);
+      const res = await db.execute(
+        'SELECT a.id, b.id, c.id FROM users a JOIN users b ON a.age = b.age JOIN users c ON c.id = b.id WHERE a.id = 7 AND b.id < 100 AND c.age = a.age');
+      const a = rows.find(r => r.id === 7)!;
+      const expected = rows.filter(b => b.age === a.age && b.id < 100).map(b => `7|${b.id}|${b.id}`).sort();
+      expect(pairs(res)).toEqual(expected);
+    });
+
+    it('keeps table-free predicates and still filters', async () => {
+      await loadUsers(50);
+      const none = await db.execute('SELECT * FROM users a JOIN users b ON a.id = b.id WHERE 1 = 0');
+      expect(none.rows).toEqual([]);
+      const one = await db.execute('SELECT * FROM users a JOIN users b ON a.id = b.id WHERE a.id = 9 AND 1 = 1');
+      expect(one.rows).toEqual([[9, 'u9', 29, 9, 'u9', 29]]);
+    });
+  });
+
   describe('before ANALYZE', () => {
     it('chooses the index for an equality and returns the right rows', async () => {
       const rows = await loadUsers(300);

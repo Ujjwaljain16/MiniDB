@@ -67,4 +67,23 @@ describe('JoinOrderer', () => {
     expect(nlj1.left.tableId).toBe('A');
     expect(nlj1.right.tableId).toBe('B');
   });
+
+  it('ANDs every condition that connects the two sides and treats none as a cross join', () => {
+    const scan = (t: string, rows: number): JoinNode => ({
+      node: { kind: 'phys_seq_scan', tableId: t as any, estRows: rows, estCost: rows / 100 } as PhysSeqScan,
+      tables: new Set([t]), estRows: rows
+    });
+    const col = (t: string, c: string) => ({ kind: 'bound_col', columnName: c, tableId: t, tableAlias: t });
+    const eq = (l: any, r: any) => ({ kind: 'bound_binary', op: '=', left: l, right: r });
+    const conds = [eq(col('A', 'x'), col('B', 'x')), eq(col('A', 'y'), col('B', 'y'))] as any[];
+
+    const joined = orderer.orderJoins([scan('A', 100), scan('B', 100)], conds) as any;
+    expect(joined.condition.kind).toBe('bound_logical');
+    expect(joined.condition.op).toBe('AND');
+    expect(joined.estRows).toBe(1000);
+
+    const cross = orderer.orderJoins([scan('A', 100), scan('B', 100)], []) as any;
+    expect(cross.condition).toEqual({ kind: 'bound_literal', value: true, type: 'BOOL' });
+    expect(cross.estRows).toBe(10000);
+  });
 });

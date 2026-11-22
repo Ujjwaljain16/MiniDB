@@ -146,11 +146,14 @@ export class BPlusTree implements IBPlusTree {
     let height = 0;
     let level: PageId[] = this._rootPageId === NULL_PAGE_ID ? [] : [this._rootPageId];
 
+    // Peeking keeps a visualisation from changing the cache it is showing.
+    const peek = this.bufferPool.peekPage?.bind(this.bufferPool);
+
     while (level.length > 0) {
       height++;
       const nextLevel: PageId[] = [];
       for (const pageId of level) {
-        const node = await this.fetchNode(pageId);
+        const node = peek ? new BPlusNode(await peek(pageId), this.colDef) : await this.fetchNode(pageId);
         try {
           const keys: (number | string | boolean | null)[] = [];
           const children: number[] = [];
@@ -170,7 +173,7 @@ export class BPlusTree implements IBPlusTree {
             nextLeafId: node.isLeaf ? node.nextLeafId : NULL_PAGE_ID,
           });
         } finally {
-          this.bufferPool.unpinPage(pageId, false);
+          if (!peek) this.bufferPool.unpinPage(pageId, false);
         }
       }
       level = nextLevel;

@@ -266,6 +266,17 @@ export class BufferPool implements IBufferPool {
     return { ...this.statsCounters };
   }
 
+  async peekPage(pageId: PageId): Promise<Buffer> {
+    const copy = Buffer.alloc(PAGE_SIZE);
+    const fi = this.pageTable.get(pageId);
+    if (fi !== undefined) {
+      this.frames[fi]!.buffer.copy(copy);
+    } else {
+      await this.diskManager.readPage(pageId, copy);
+    }
+    return copy;
+  }
+
   /** Every frame's current contents, empty frames included (pageId -1). */
   snapshot(): Array<{ frame: number; pageId: number; pinCount: number; dirty: boolean; kind: PageKind }> {
     return this.frames.map((f, frame) => ({

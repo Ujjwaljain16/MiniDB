@@ -101,6 +101,13 @@ export interface IBufferPool {
   unpinPage(pageId: PageId, isDirty: boolean): void;
 
   /**
+   * A private copy of a page's current contents that leaves the pool exactly as
+   * it was: no pin, no hit/miss counted, no eviction, no replacement history.
+   * For inspection tools only; never write through it.
+   */
+  peekPage?(pageId: PageId): Promise<Buffer>;
+
+  /**
    * Force a specific page to disk immediately, regardless of pin count.
    * Used during checkpoint and shutdown.
    */

@@ -108,6 +108,25 @@ export interface ResultSet {
   readonly rowsAffected?: number;
   /** Wall-clock execution time in milliseconds. */
   readonly executionMs?:  number;
+  /** The executed plan, with actual rows and time per operator. */
+  readonly plan?:         PlanInfo;
+}
+
+/** One operator of a query plan, shaped for display. */
+export interface PlanInfo {
+  /** Physical node kind, e.g. 'phys_index_scan'. */
+  kind: string;
+  /** Human name, e.g. 'Index Scan'. */
+  label: string;
+  /** Table, index and key range, predicate, join condition, etc. */
+  detail: string;
+  estRows: number;
+  estCost: number;
+  /** Rows the operator produced (summed over re-opens, e.g. a join's inner side). */
+  actualRows?: number;
+  /** Time spent in the operator, including its children, in milliseconds. */
+  timeMs?: number;
+  children: PlanInfo[];
 }
 
 // ─── Serialization sizes (bytes per type on disk) ─────────────────────────────

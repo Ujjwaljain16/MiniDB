@@ -1,6 +1,7 @@
 import type { PhysicalNode } from '../optimizer/PhysicalPlan.js';
 import type { ExecContext, IOperator, TupleSlot } from '../common/interfaces.js';
-import type { ResultSet } from '../common/types.js';
+import type { ResultSet, PlanInfo } from '../common/types.js';
+import { describeNode, renderPlan, toPlanInfo } from '../optimizer/Explain.js';
 
 import { SeqScanOp } from './operators/SeqScanOp.js';
 import { IndexScanOp } from './operators/IndexScanOp.js';
@@ -19,7 +20,7 @@ export interface OperatorStats {
 export class TrackedOperator implements IOperator {
   public stats: OperatorStats = { rowsProduced: 0, elapsedMs: 0 };
 
-  constructor(public inner: IOperator, public plan: PhysicalNode) {}
+  constructor(public inner: IOperator, public plan: PhysicalNode, public children: TrackedOperator[] = []) {}
 
   async open(ctx: ExecContext): Promise<void> {
     const s = performance.now();
@@ -50,7 +51,12 @@ export class Executor {
    * wrapped in TrackedOperators for metrics.
    */
   buildOperatorTree(plan: PhysicalNode): TrackedOperator {
-    const buildChild = (node: PhysicalNode) => this.buildOperatorTree(node);
+    const children: TrackedOperator[] = [];
+    const buildChild = (node: PhysicalNode) => {
+      const child = this.buildOperatorTree(node);
+      children.push(child);
+      return child;
+    };
     let inner: IOperator;
 
     switch (plan.kind) {
@@ -84,7 +90,7 @@ export class Executor {
         throw new Error(`Unsupported physical node kind: ${(plan as any).kind}`);
     }
 
-    return new TrackedOperator(inner, plan);
+    return new TrackedOperator(inner, plan, children);
   }
 
   /**
@@ -106,62 +112,52 @@ export class Executor {
       await root.close();
     }
 
+    const executedPlan = this.explainAnalyzePlan(root);
+
     // Determine output columns if possible
     let columns: string[] = [];
-    while (plan.kind === 'phys_limit') plan = plan.child;
-    if (plan.kind === 'phys_project') {
-      columns = plan.projections.map(p => p.alias || 'col');
-    } else if (plan.kind === 'phys_seq_scan' || plan.kind === 'phys_index_scan') {
-      columns = plan.schema.map(c => c.name);
-    } else if (plan.kind === 'phys_insert' || plan.kind === 'phys_delete') {
+    let output = plan;
+    while (output.kind === 'phys_limit') output = output.child;
+    if (output.kind === 'phys_project') {
+      columns = output.projections.map(p => p.alias || 'col');
+    } else if (output.kind === 'phys_seq_scan' || output.kind === 'phys_index_scan') {
+      columns = output.schema.map(c => c.name);
+    } else if (output.kind === 'phys_insert' || output.kind === 'phys_delete') {
       columns = ['affected_rows'];
       const totalAffected = rows.length > 0 ? rows.reduce((acc, r) => acc + r[0], 0) : 0;
-      return { columns, rows: [[totalAffected]], rowsAffected: totalAffected };
+      return { columns, rows: [[totalAffected]], rowsAffected: totalAffected, plan: executedPlan };
     } else {
       columns = rows.length > 0 ? rows[0]!.map((_, i) => `col${i}`) : [];
     }
 
-    return { columns, rows };
+    return { columns, rows, plan: executedPlan };
   }
 
-  /**
-   * Generates a string representation of the EXPLAIN tree.
-   */
-  explainTree(plan: PhysicalNode, indent: number = 0): string {
-    const pad = '  '.repeat(indent);
-    let line = `${pad}${plan.kind} (cost=${plan.estCost?.toFixed(2) || 0}, estRows=~${plan.estRows || 0})`;
-
-    if (plan.kind === 'phys_filter') {
-      line += `\n${this.explainTree((plan as any).child, indent + 1)}`;
-    } else if (plan.kind === 'phys_project') {
-      line += `\n${this.explainTree((plan as any).child, indent + 1)}`;
-    } else if (plan.kind === 'phys_nlj') {
-      line += `\n${this.explainTree((plan as any).outer, indent + 1)}\n${this.explainTree((plan as any).inner, indent + 1)}`;
-    }
-
-    return line;
+  /** Text for EXPLAIN: the plan tree with table, index range, predicates and estimates. */
+  explainTree(plan: PhysicalNode): string {
+    return renderPlan(this.explainPlan(plan));
   }
 
-  /**
-   * Generates a string representation of the EXPLAIN ANALYZE tree with actual stats.
-   */
-  explainAnalyzeTree(op: TrackedOperator, indent: number = 0): string {
-    const pad = '  '.repeat(indent);
-    let line = `${pad}${op.plan.kind} (cost=${op.plan.estCost?.toFixed(2) || 0}, estRows=~${op.plan.estRows || 0})`;
-    line += `\n${pad}  [Actual rows: ${op.stats.rowsProduced}, Time: ${op.stats.elapsedMs.toFixed(3)} ms]`;
-    
-    if (op.inner instanceof FilterOp || op.inner instanceof ProjectOp || op.inner instanceof DeleteOp) {
-      const child = (op.inner as any).child as TrackedOperator;
-      if (child instanceof TrackedOperator) {
-        line += `\n${this.explainAnalyzeTree(child, indent + 1)}`;
-      }
-    } else if (op.inner instanceof NestedLoopJoinOp) {
-      const outer = (op.inner as any).outer as TrackedOperator;
-      const innerChild = (op.inner as any).inner as TrackedOperator;
-      if (outer instanceof TrackedOperator) line += `\n${this.explainAnalyzeTree(outer, indent + 1)}`;
-      if (innerChild instanceof TrackedOperator) line += `\n${this.explainAnalyzeTree(innerChild, indent + 1)}`;
-    }
+  /** Text for EXPLAIN ANALYZE: the plan tree with actual rows and time per operator. */
+  explainAnalyzeTree(op: TrackedOperator): string {
+    return renderPlan(this.explainAnalyzePlan(op));
+  }
 
-    return line;
+  /** Structured plan with estimates only, for EXPLAIN. */
+  explainPlan(physical: PhysicalNode): PlanInfo {
+    return toPlanInfo(physical);
+  }
+
+  /** Structured plan of an executed operator tree, with actual rows and time. */
+  explainAnalyzePlan(root: TrackedOperator): PlanInfo {
+    return {
+      kind: root.plan.kind,
+      ...describeNode(root.plan),
+      estRows: root.plan.estRows,
+      estCost: root.plan.estCost,
+      actualRows: root.stats.rowsProduced,
+      timeMs: root.stats.elapsedMs,
+      children: root.children.map(child => this.explainAnalyzePlan(child)),
+    };
   }
 }

@@ -145,6 +145,56 @@ describe('SQL correctness', () => {
     });
   });
 
+  describe('EXPLAIN and plans', () => {
+    const SELF_JOIN = 'SELECT u1.id, u2.id FROM users u1 JOIN users u2 ON u1.id = u2.age WHERE u1.id = 25';
+
+    it('explains a self-join with table, index range and join condition', async () => {
+      await loadUsers(300);
+      const res = await db.execute(`EXPLAIN ${SELF_JOIN}`);
+      const text = String(res.rows[0]![0]);
+      expect(text).toContain('phys_nlj [u1.id = u2.age]');
+      expect(text).toContain('phys_index_scan [users AS u1 using idx_id: id = 25]');
+      expect(text).toContain('phys_filter [u1.id = 25]');
+      expect(text).toContain('phys_seq_scan [users AS u2]');
+      expect(text).not.toContain('rows=~0');
+    });
+
+    it('explains analyze a self-join with actual rows', async () => {
+      await loadUsers(300);
+      const res = await db.execute(`EXPLAIN ANALYZE ${SELF_JOIN}`);
+      const text = String(res.rows[0]![0]);
+      expect(text).toMatch(/phys_project \[u1\.id, u2\.id\].*actual rows=8,/);
+      expect(text).toMatch(/phys_index_scan .*actual rows=1,/);
+    });
+
+    it('attaches the executed plan with actual rows to every result', async () => {
+      await loadUsers(300);
+      const res = await db.execute(`${SELF_JOIN} LIMIT 3`);
+      expect(res.rows.length).toBe(3);
+      const plan = res.plan!;
+      expect(plan).toMatchObject({ kind: 'phys_limit', label: 'Limit', detail: '3', estRows: 3, actualRows: 3 });
+      expect(plan.timeMs).toBeGreaterThanOrEqual(0);
+      const join = plan.children[0]!.children[0]!;
+      expect(join).toMatchObject({ label: 'Nested Loop Join', detail: 'u1.id = u2.age' });
+      expect(join.children.map(c => c.label)).toEqual(['Filter', 'Seq Scan']);
+      expect(join.children[0]!.children[0]).toMatchObject({ label: 'Index Scan', actualRows: 1 });
+
+      const del = await db.execute('DELETE FROM users WHERE id = 1');
+      expect(del.plan).toMatchObject({ label: 'Delete', detail: 'FROM users' });
+      const ins = await db.execute("INSERT INTO users VALUES (1, 'u1', 21)");
+      expect(ins.plan).toMatchObject({ label: 'Insert', detail: 'INTO users (1 row)', children: [] });
+    });
+
+    it('builds an estimate-only plan for the UI', async () => {
+      await loadUsers(10);
+      const logical = db.binder.bind({ kind: 'select', projections: [{ kind: 'star' }], from: { table: 'users' }, joins: [], limit: 2 } as any);
+      const plan = db.executor.explainPlan(db.planner.plan(logical));
+      expect(plan.label).toBe('Limit');
+      expect(plan.actualRows).toBeUndefined();
+      expect(plan.children[0]!.children[0]).toMatchObject({ label: 'Seq Scan', detail: 'users', estRows: 1000, children: [] });
+    });
+  });
+
   describe('LIMIT', () => {
     it('returns at most n rows and leaves no page pinned', async () => {
       const rows = await loadUsers(3000);

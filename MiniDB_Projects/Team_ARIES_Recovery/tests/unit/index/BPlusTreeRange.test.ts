@@ -65,6 +65,37 @@ describe('BPlusTree range scans', () => {
     expect(pool.stats().pinnedPages).toBe(0);
   });
 
+  it('deletes the entry of the given RID among duplicates', async () => {
+    const live = new Map<number, Set<number>>();
+    for (let i = 0; i < 6000; i++) {
+      await tree.insert(i % 10, makeRID(1, i));
+      if (!live.has(i % 10)) live.set(i % 10, new Set());
+      live.get(i % 10)!.add(i);
+    }
+    // Delete a deterministic, scattered half of the rows.
+    for (let i = 0; i < 6000; i++) {
+      if ((i * 7919) % 2 === 0) {
+        await tree.delete(i % 10, makeRID(1, i));
+        live.get(i % 10)!.delete(i);
+      }
+    }
+    for (let k = 0; k < 10; k++) {
+      const got: number[] = [];
+      for await (const rid of tree.searchRange(k, k)) got.push(rid.slotId);
+      expect({ k, slots: got.sort((a, b) => a - b) }).toEqual({ k, slots: [...live.get(k)!].sort((a, b) => a - b) });
+    }
+    expect(pool.stats().pinnedPages).toBe(0);
+  });
+
+  it('stores NULL keys as zero so they can be found and deleted', async () => {
+    for (let i = -5; i <= 5; i++) await tree.insert(i, makeRID(0, i + 10));
+    await tree.insert(null, makeRID(0, 99));
+    expect(await collect(-5, -3)).toEqual([5, 6, 7]);
+    expect((await collect(0, 0)).sort((a, b) => a - b)).toEqual([10, 99]);
+    await tree.delete(null, makeRID(0, 99));
+    expect(await collect(0, 0)).toEqual([10]);
+  });
+
   it('describes every node breadth-first and unpins them', async () => {
     expect(await tree.describe()).toEqual({ rootPageId: -1, height: 0, nodes: [] });
 

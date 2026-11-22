@@ -196,6 +196,7 @@ export class BPlusTree implements IBPlusTree {
   }
 
   async insert(key: ColValue, rid: RID): Promise<void> {
+    key = this.storedKey(key);
     if (this._rootPageId === NULL_PAGE_ID) {
       // Create new root leaf node
       const [newId, buf] = await this.bufferPool.newPage();
@@ -362,33 +363,18 @@ export class BPlusTree implements IBPlusTree {
     await this.insertIntoParent(parent.pageId, splitKey, rightParent.pageId, parentPath);
   }
 
-  async delete(key: ColValue): Promise<void> {
+  /**
+   * Remove the entry for `key`. With duplicate keys, pass the row's `rid` so
+   * the entry of that row (not just any row with the same key) is removed.
+   */
+  async delete(key: ColValue, rid?: RID): Promise<void> {
     if (this._rootPageId === NULL_PAGE_ID) return;
 
-    const parentPath: BPlusNode[] = [];
-    let pageId = this._rootPageId;
-    let leafNode: BPlusNode;
+    const found = await this.findLeafEntry(this._rootPageId, this.storedKey(key), rid, []);
+    if (!found) return; // Key not found
+    const { leaf: leafNode, index, path: parentPath } = found;
 
-    // 1. Descend to correct leaf
-    while (true) {
-      const node = await this.fetchNode(pageId);
-      if (node.isLeaf) {
-        leafNode = node;
-        break;
-      }
-      parentPath.push(node);
-      const childIdx = node.findChildIndex(key);
-      pageId = node.getChildId(childIdx);
-    }
-
-    // Delete the entry
-    const deleted = leafNode.deleteLeafEntry(key);
-    if (!deleted) {
-      // Key not found
-      this.bufferPool.unpinPage(leafNode.pageId, false);
-      for (const p of parentPath) this.bufferPool.unpinPage(p.pageId, false);
-      return;
-    }
+    this.removeLeafEntryAt(leafNode, index);
 
     // Check underflow
     const minKeys = Math.ceil((leafNode.maxLeafEntries - 1) / 2);
@@ -401,6 +387,60 @@ export class BPlusTree implements IBPlusTree {
     // Handle underflow
     this.bufferPool.unpinPage(leafNode.pageId, true);
     await this.handleUnderflow(leafNode.pageId, parentPath);
+  }
+
+  /**
+   * Find the leaf entry for (key, rid), trying every child whose range can hold
+   * `key` since duplicates may span several leaves. On success the leaf and
+   * the returned path stay pinned, as delete's underflow handling expects.
+   */
+  private async findLeafEntry(
+    pageId: PageId, key: ColValue, rid: RID | undefined, path: BPlusNode[]
+  ): Promise<{ leaf: BPlusNode; index: number; path: BPlusNode[] } | null> {
+    const node = await this.fetchNode(pageId);
+    if (node.isLeaf) {
+      for (let i = 0; i < node.numKeys; i++) {
+        const entry = node.getLeafEntry(i);
+        const cmp = compareKeys(entry.key, key, this.colDef);
+        if (cmp > 0) break;
+        if (cmp === 0 && (!rid || (entry.rid.pageId === rid.pageId && entry.rid.slotId === rid.slotId))) {
+          return { leaf: node, index: i, path };
+        }
+      }
+      this.bufferPool.unpinPage(pageId, false);
+      return null;
+    }
+
+    const last = node.findChildIndex(key);
+    for (let i = this.lowerBoundChild(node, key); i <= last; i++) {
+      const found = await this.findLeafEntry(node.getChildId(i), key, rid, [...path, node]);
+      if (found) return found;
+    }
+    this.bufferPool.unpinPage(pageId, false);
+    return null;
+  }
+
+  /** BPlusNode can only delete the first entry with a key, so swap the target into that slot first. */
+  private removeLeafEntryAt(node: BPlusNode, index: number): void {
+    const { key, rid } = node.getLeafEntry(index);
+    let first = index;
+    while (first > 0 && compareKeys(node.getLeafEntry(first - 1).key, key, this.colDef) === 0) first--;
+    if (first !== index) {
+      node.setLeafEntry(index, key, node.getLeafEntry(first).rid);
+      node.setLeafEntry(first, key, rid);
+    }
+    node.deleteLeafEntry(key);
+  }
+
+  /** NULL keys are written to the page as zero bytes, so order and match them as that value. */
+  private storedKey(key: ColValue): ColValue {
+    if (key !== null) return key;
+    switch (this.colDef.type) {
+      case 'VARCHAR': return '';
+      case 'BOOL': return false;
+      case 'BIGINT': return 0n;
+      default: return 0;
+    }
   }
 
   private async handleUnderflow(pageId: PageId, parentPath: BPlusNode[]): Promise<void> {
@@ -447,7 +487,7 @@ export class BPlusTree implements IBPlusTree {
         // Borrow
         if (isLeaf) {
           const entry = leftSibling.getLeafEntry(leftSibling.numKeys - 1);
-          leftSibling.deleteLeafEntry(entry.key);
+          this.removeLeafEntryAt(leftSibling, leftSibling.numKeys - 1);
           node.insertLeafEntry(entry.key, entry.rid);
           parent.setInternalKey(myIdx - 1, node.getLeafEntry(0).key);
         } else {

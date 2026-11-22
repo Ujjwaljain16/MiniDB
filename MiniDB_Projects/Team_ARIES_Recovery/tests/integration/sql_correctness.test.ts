@@ -160,6 +160,25 @@ describe('SQL correctness', () => {
     });
   });
 
+  describe('non-unique index', () => {
+    it('stays consistent with the table after deletes', async () => {
+      const rows = await loadUsers(2000, { indexOn: ['id', 'age'] });
+      await db.execute('DELETE FROM users WHERE id <= 700');
+      await db.execute('DELETE FROM users WHERE id > 1500 AND id < 1600');
+      const live = rows.filter(r => r.id > 700 && !(r.id > 1500 && r.id < 1600));
+
+      const explain = await db.execute('EXPLAIN SELECT id FROM users WHERE age = 30');
+      expect(String(explain.rows[0]![0])).toContain('idx_age');
+      for (const age of [20, 30, 45, 59]) {
+        expect({ age, ids: await ids(`SELECT id FROM users WHERE age = ${age}`) })
+          .toEqual({ age, ids: live.filter(r => r.age === age).map(r => r.id) });
+      }
+      const tree = db.catalog.getTable('users' as any).indexes['idx_age' as any]!.tree;
+      const leaves = (await tree.describe()).nodes.filter((n: { isLeaf: boolean }) => n.isLeaf);
+      expect(leaves.reduce((n: number, l: { keys: unknown[] }) => n + l.keys.length, 0)).toBe(live.length);
+    });
+  });
+
   describe('B+ tree inspection', () => {
     it('describes the index built through SQL and leaves nothing pinned', async () => {
       await loadUsers(1500);

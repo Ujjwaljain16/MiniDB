@@ -26,10 +26,16 @@ export class DeleteOp extends Operator {
 
     let affectedRows = 0;
 
+    // Collect every match before changing anything: deleting while an index
+    // scan is walking a leaf shifts its entries and makes the scan skip rows.
+    const matches: TupleSlot[] = [];
     while (true) {
       const slot = await this.child.next();
       if (!slot) break;
+      matches.push(slot);
+    }
 
+    for (const slot of matches) {
       if (!slot.rid) {
         throw new Error('DeleteOp received a TupleSlot without an RID. Ensure projections preserve RIDs.');
       }

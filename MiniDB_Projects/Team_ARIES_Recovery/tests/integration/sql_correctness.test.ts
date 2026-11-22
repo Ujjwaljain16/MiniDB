@@ -145,6 +145,21 @@ describe('SQL correctness', () => {
     });
   });
 
+  describe('DELETE', () => {
+    it('deletes every matching row when an index scan drives it', async () => {
+      await loadUsers(2000);
+      await db.execute('ANALYZE users');
+      const explain = await db.execute('EXPLAIN DELETE FROM users WHERE id > 1990');
+      expect(String(explain.rows[0]![0])).toContain('phys_index_scan');
+
+      const res = await db.execute('DELETE FROM users WHERE id > 1990');
+      expect(res.rowsAffected).toBe(10);
+      expect(await ids('SELECT id FROM users WHERE id > 1985')).toEqual([1986, 1987, 1988, 1989, 1990]);
+      expect(await ids('SELECT id FROM users WHERE id >= 1985 AND age > 0')).toEqual([1985, 1986, 1987, 1988, 1989, 1990]);
+      expect(db.bufferPool.stats().pinnedPages).toBe(0);
+    });
+  });
+
   describe('B+ tree inspection', () => {
     it('describes the index built through SQL and leaves nothing pinned', async () => {
       await loadUsers(1500);

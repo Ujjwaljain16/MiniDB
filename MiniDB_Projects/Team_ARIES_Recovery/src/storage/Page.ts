@@ -7,6 +7,7 @@ export class Page {
   private static readonly OFFSET_FREE_SPACE = 6;
   private static readonly OFFSET_PAGE_LSN = 8;
   private static readonly OFFSET_PAGE_TYPE = 16;
+  private static readonly OFFSET_OWNER = 17;
 
   private buf: Buffer;
 
@@ -56,14 +57,23 @@ export class Page {
     this.buf.writeUInt8(type, Page.OFFSET_PAGE_TYPE);
   }
 
+  /** Heap id of the table that owns this heap page; 0 means nobody. */
+  get owner(): number {
+    return this.buf.readUInt32LE(Page.OFFSET_OWNER);
+  }
+  set owner(heapId: number) {
+    this.buf.writeUInt32LE(heapId, Page.OFFSET_OWNER);
+  }
+
   /** Initialize a new page by setting initial header values */
-  init(pageId: PageId, pageType: number = 0): void {
+  init(pageId: PageId, pageType: number = 0, owner: number = 0): void {
     this.buf.fill(0);
     this.pageId = pageId;
     this.numSlots = 0;
     this.freeSpacePtr = PAGE_SIZE;
     this.pageLsn = 0 as LSN;
     this.pageType = pageType;
+    this.owner = owner;
   }
 
   freeSpace(): number {

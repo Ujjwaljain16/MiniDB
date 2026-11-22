@@ -53,7 +53,7 @@ export class MiniDB {
     this.txnManager = new TxnManager(this.lockManager, this.logManager);
 
     // 4. Recovery
-    await recover(this.logManager, this.bufferPool, this.txnManager, this.dataDir);
+    await recover(this.logManager, this.bufferPool, this.txnManager, this.dataDir, tableId => this.catalog.heapIdOf(tableId));
 
     // 5. Background Tasks
     this.deadlockDetector = new DeadlockDetector(this.lockManager, this.txnManager);

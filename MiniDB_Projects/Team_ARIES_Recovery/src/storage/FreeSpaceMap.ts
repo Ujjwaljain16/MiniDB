@@ -48,4 +48,29 @@ export class FreeSpaceMap {
       this.bufferPool.unpinPage(this.fsmPageId, false);
     }
   }
+
+  /**
+   * Like findFreePage, but only considers the given pages (one table's heap),
+   * reading the FSM page once.
+   */
+  async findFreePageAmong(requiredBytes: number, pageIds: readonly PageId[]): Promise<PageId | null> {
+    if (pageIds.length === 0) return null;
+    const requiredFsmValue = Math.ceil(requiredBytes / 16);
+    if (requiredFsmValue > 255) return null;
+
+    const buf = await this.bufferPool.fetchPage(this.fsmPageId);
+    try {
+      const maxTracked = PAGE_SIZE - PAGE_HEADER_SIZE;
+      for (const pageId of pageIds) {
+        const fsmIndex = pageId - this.fsmPageId - 1;
+        if (fsmIndex < 0 || fsmIndex >= maxTracked) continue;
+        if (buf.readUInt8(PAGE_HEADER_SIZE + fsmIndex) >= requiredFsmValue) {
+          return pageId;
+        }
+      }
+      return null;
+    } finally {
+      this.bufferPool.unpinPage(this.fsmPageId, false);
+    }
+  }
 }

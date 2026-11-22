@@ -212,6 +212,8 @@ export interface IndexDef {
 /** Full catalog entry for a single table. */
 export interface CatalogEntry {
   readonly tableId:    TableId;
+  /** Owner id stamped on this table's heap pages; assigned by the catalog. */
+  heapId?:             number;
   heapFile:            any; // IHeapFile instance injected at runtime
   readonly schema:     Schema;
   readonly primaryKey: string;

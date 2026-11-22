@@ -50,3 +50,9 @@ export const PAGE_HEADER_SIZE = 24 as const;
 
 /** Bytes per slot-directory entry: offset(2B) + length(2B). */
 export const SLOT_ENTRY_SIZE = 4 as const;
+
+/**
+ * Heap id assumed by callers that manage a single heap without a catalog
+ * (bare HeapFile users, recovery without an owner resolver). Catalog ids start here too.
+ */
+export const DEFAULT_HEAP_ID = 1 as const;

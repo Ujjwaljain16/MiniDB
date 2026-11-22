@@ -1,4 +1,4 @@
-import type { IHeapFile } from '../common/interfaces.js';
+import type { IHeapFile, IBufferPool } from '../common/interfaces.js';
 import type { Tuple, Schema, RID, PageId } from '../common/types.js';
 import { makeRID, colByteSize } from '../common/types.js';
 import { Page } from './Page.js';
@@ -7,6 +7,7 @@ import { DiskManager } from './DiskManager.js';
 import { FreeSpaceMap } from './FreeSpaceMap.js';
 import type { ExecContext } from '../common/interfaces.js';
 import { LogType } from '../common/interfaces.js';
+import { DEFAULT_HEAP_ID } from '../common/config.js';
 
 export function serializeTuple(tuple: Tuple, schema: Schema): Buffer {
   const nullBitmapLen = Math.ceil(schema.length / 8);
@@ -112,49 +113,105 @@ export function deserializeTuple(buf: Buffer, schema: Schema): Tuple {
   return tuple;
 }
 
+/** Create the FSM page as page 0 if the data file is still empty. */
+export async function ensureFsmPage(bufferPool: IBufferPool, diskManager: DiskManager): Promise<void> {
+  if (diskManager.getPageCount() === 0) {
+    const [pageId, buf] = await bufferPool.newPage();
+    // Expect pageId to be 0 for FSM
+    if (pageId !== 0) {
+      bufferPool.unpinPage(pageId, false);
+      throw new Error('FSM page ID must be 0');
+    }
+    const page = new Page(buf);
+    page.init(0 as PageId, 3); // type 3 = meta
+    bufferPool.unpinPage(0 as PageId, true);
+  }
+}
+
+/**
+ * One table's heap. All tables share the data file, so each heap page records
+ * the heapId of its table and a HeapFile only ever touches its own pages.
+ */
 export class HeapFile implements IHeapFile {
   private fsm: FreeSpaceMap;
+  private ownPages: PageId[] | null;
+  private ownPagesLoading: Promise<PageId[]> | null = null;
 
+  /**
+   * @param knownPages the heap's page ids when they are already known
+   *   (`[]` for a brand-new table); otherwise they are found on first use.
+   */
   constructor(
     private tableId: string,
     private bufferPool: BufferPool,
-    private diskManager: DiskManager
+    private diskManager: DiskManager,
+    readonly heapId: number = DEFAULT_HEAP_ID,
+    knownPages?: readonly PageId[]
   ) {
     this.fsm = new FreeSpaceMap(this.bufferPool, 0 as PageId);
+    this.ownPages = knownPages ? [...knownPages] : null;
   }
 
-  private async ensureFsmExists(): Promise<void> {
-    if (this.diskManager.getPageCount() === 0) {
-      const [pageId, buf] = await this.bufferPool.newPage();
-      // Expect pageId to be 0 for FSM
-      if (pageId !== 0) {
-        this.bufferPool.unpinPage(pageId, false);
-        throw new Error('FSM page ID must be 0');
+  private async pages(): Promise<PageId[]> {
+    if (this.ownPages) return this.ownPages;
+    this.ownPagesLoading ??= this.findOwnPages();
+    this.ownPages = await this.ownPagesLoading;
+    return this.ownPages;
+  }
+
+  private async findOwnPages(): Promise<PageId[]> {
+    const found: PageId[] = [];
+    const totalPages = this.diskManager.getPageCount();
+    for (let pageId = 1; pageId < totalPages; pageId++) {
+      const buf = await this.bufferPool.fetchPage(pageId as PageId);
+      try {
+        const page = new Page(buf);
+        if (page.pageType === 0 && page.owner === this.heapId) found.push(pageId as PageId);
+      } finally {
+        this.bufferPool.unpinPage(pageId as PageId, false);
       }
-      const page = new Page(buf);
-      page.init(0 as PageId, 3); // type 3 = meta
-      this.bufferPool.unpinPage(0 as PageId, true);
     }
+    return found;
+  }
+
+  /**
+   * Disown every page of this heap (used by DROP TABLE). The pages are written
+   * out right away so a later table that reuses this heapId can't adopt them.
+   */
+  async releasePages(): Promise<void> {
+    const own = await this.pages();
+    for (const pageId of own) {
+      const buf = await this.bufferPool.fetchPage(pageId);
+      try {
+        new Page(buf).owner = 0;
+      } finally {
+        this.bufferPool.unpinPage(pageId, true);
+      }
+      await this.bufferPool.flushPage(pageId);
+    }
+    this.ownPages = [];
   }
 
   async insertTuple(tuple: Tuple, schema: Schema, ctx?: ExecContext): Promise<RID> {
-    await this.ensureFsmExists();
+    await ensureFsmPage(this.bufferPool, this.diskManager);
+    const own = await this.pages();
 
     const buf = serializeTuple(tuple, schema);
     const requiredBytes = buf.length;
 
-    let targetPageId = await this.fsm.findFreePage(requiredBytes, this.pageCount());
+    let targetPageId = await this.fsm.findFreePageAmong(requiredBytes, own);
     let pageBuf: Buffer;
-    
+
     if (targetPageId !== null) {
       pageBuf = await this.bufferPool.fetchPage(targetPageId);
     } else {
       let newPId: PageId;
       [newPId, pageBuf] = await this.bufferPool.newPage();
       targetPageId = newPId;
-      
+
       const page = new Page(pageBuf);
-      page.init(targetPageId, 0); // type 0 = heap
+      page.init(targetPageId, 0, this.heapId); // type 0 = heap
+      own.push(targetPageId);
     }
 
     const page = new Page(pageBuf);
@@ -252,12 +309,14 @@ export class HeapFile implements IHeapFile {
   }
 
   async *scan(schema: Schema): AsyncIterableIterator<[RID, Tuple]> {
-    const totalPages = this.pageCount();
-    for (let pageId = 1; pageId < totalPages; pageId++) {
-      const buf = await this.bufferPool.fetchPage(pageId as PageId);
+    const own = await this.pages();
+    // Pages this heap gains during the scan are not visited, as before.
+    const numPages = own.length;
+    for (let i = 0; i < numPages; i++) {
+      const pageId = own[i]!;
+      const buf = await this.bufferPool.fetchPage(pageId);
       try {
         const page = new Page(buf);
-        if (page.pageType !== 0) continue; // Skip non-heap pages (e.g., B+Tree pages or FSM)
         const numSlots = page.numSlots;
         for (let slotId = 0; slotId < numSlots; slotId++) {
           const recordBuf = page.getRecord(slotId as any);

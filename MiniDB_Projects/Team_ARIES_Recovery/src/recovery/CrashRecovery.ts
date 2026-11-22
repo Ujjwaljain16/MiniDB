@@ -6,14 +6,19 @@ import type { LSN, PageId, TxnId } from '../common/types.js';
 import { TxnState } from '../common/interfaces.js';
 import { Page } from '../storage/Page.js';
 import { CheckpointManager } from './CheckpointManager.js';
+import { DEFAULT_HEAP_ID } from '../common/config.js';
 import fs from 'fs';
 import path from 'path';
+
+/** Maps a log record's tableId to the heapId its re-created pages must carry. */
+export type HeapOwnerResolver = (tableId: string | undefined) => number;
 
 export async function recover(
   logManager: ILogManager,
   bufferPool: IBufferPool,
   txnManager: ITxnManager,
-  dataDir: string
+  dataDir: string,
+  heapOwnerOf: HeapOwnerResolver = () => DEFAULT_HEAP_ID
 ): Promise<void> {
 
   const checkpointManager = new CheckpointManager(logManager, bufferPool, txnManager, dataDir);
@@ -114,7 +119,7 @@ export async function recover(
       if (Number(page.pageLsn) < Number(record.lsn)) {
         if (page.freeSpacePtr === 0) {
           // Page was never flushed to disk before crash
-          page.init(pageId, pageId === 0 ? 3 : 0);
+          page.init(pageId, pageId === 0 ? 3 : 0, pageId === 0 ? 0 : heapOwnerOf(record.tableId as string | undefined));
         }
 
         if (record.type === 'INSERT' && record.afterImage) {

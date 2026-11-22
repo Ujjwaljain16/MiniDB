@@ -1,5 +1,6 @@
 import type { ICatalog, CatalogEntry, TableStats, IndexDef } from '../common/interfaces.js';
 import type { TableId, IndexId, PageId } from '../common/types.js';
+import { DEFAULT_HEAP_ID } from '../common/config.js';
 import type { CatalogStorage } from './CatalogStorage.js';
 import { HeapFile } from '../storage/HeapFile.js';
 import { BPlusTree } from '../index/BPlusTree.js';
@@ -19,7 +20,8 @@ export class Catalog implements ICatalog {
     
     // Instantiate in-memory objects
     for (const entry of this.tablesMap.values()) {
-      entry.heapFile = new HeapFile(entry.tableId as string, this.bufferPool, this.diskManager);
+      entry.heapId ??= this.nextHeapId();
+      entry.heapFile = new HeapFile(entry.tableId as string, this.bufferPool, this.diskManager, entry.heapId);
       for (const [idxName, idxDef] of Object.entries(entry.indexes)) {
         const colDef = entry.schema.find(c => c.name === idxDef.column);
         (idxDef as any).tree = new BPlusTree(this.bufferPool, colDef!, (idxDef as any).rootPageId, async (newRoot) => {
@@ -51,6 +53,20 @@ export class Catalog implements ICatalog {
     return Array.from(this.tablesMap.keys()) as TableId[];
   }
 
+  /** Heap id of a table, or 0 (no owner) for a table that no longer exists. */
+  heapIdOf(tableId: TableId | string | undefined): number {
+    if (tableId === undefined) return 0;
+    return this.tablesMap.get(tableId as string)?.heapId ?? 0;
+  }
+
+  private nextHeapId(): number {
+    let max = DEFAULT_HEAP_ID - 1;
+    for (const entry of this.tablesMap.values()) {
+      if (entry.heapId !== undefined && entry.heapId > max) max = entry.heapId;
+    }
+    return max + 1;
+  }
+
   getTable(tableId: TableId): CatalogEntry {
     const entry = this.tablesMap.get(tableId as string);
     if (!entry) throw new Error(`TableNotFoundError: Table '${tableId}' not found`);
@@ -62,9 +78,11 @@ export class Catalog implements ICatalog {
       throw new Error(`TableAlreadyExistsError: Table '${entry.tableId}' already exists`);
     }
     
+    const heapId = this.nextHeapId();
     const fullEntry: CatalogEntry = {
       ...entry,
-      heapFile: new HeapFile(entry.tableId as string, this.bufferPool, this.diskManager),
+      heapId,
+      heapFile: new HeapFile(entry.tableId as string, this.bufferPool, this.diskManager, heapId, []),
       stats: {
         rowCount: 0,
         columnStats: {}
@@ -79,6 +97,7 @@ export class Catalog implements ICatalog {
     if (!this.tablesMap.has(tableId as string)) {
       throw new Error(`TableNotFoundError: Table '${tableId}' not found`);
     }
+    await this.tablesMap.get(tableId as string)!.heapFile.releasePages();
     this.tablesMap.delete(tableId as string);
     await this.flush();
   }

@@ -52,6 +52,22 @@ export interface IDiskManager {
   close(): Promise<void>;
 }
 
+/** What a page holds, from its type byte (offset 16). Page 0 is always the FSM. */
+export type PageKind = 'heap' | 'btree-leaf' | 'btree-internal' | 'fsm' | 'unknown';
+
+/**
+ * A buffer pool page access, for visualising the pool. 'new' pages are
+ * 'unknown' because they are still all zeros when the event fires.
+ */
+export interface PageEvent {
+  type: 'hit' | 'miss' | 'new' | 'evict' | 'flush';
+  pageId: number;
+  frame: number;
+  kind: PageKind;
+  /** Set on 'evict': whether the victim had to be written back. */
+  dirty?: boolean;
+}
+
 /**
  * IBufferPool — the central cache between disk I/O and all upper layers.
  *

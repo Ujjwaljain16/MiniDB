@@ -1,6 +1,7 @@
 import { BufferPool } from '../../../src/storage/BufferPool';
 import { DiskManager } from '../../../src/storage/DiskManager';
-import type { ILogManager, LogRecord } from '../../../src/common/interfaces';
+import { MemDiskManager } from '../../../src/storage/MemDiskManager';
+import type { ILogManager, LogRecord, PageEvent } from '../../../src/common/interfaces';
 import type { PageId, LSN } from '../../../src/common/types';
 import { INVALID_LSN } from '../../../src/common/types';
 import { PAGE_SIZE } from '../../../src/common/config';
@@ -155,4 +156,83 @@ describe('BufferPool', () => {
     expect(stats.hits + stats.misses).toBe(OPERATIONS);
     expect(stats.evictions).toBeGreaterThan(0);
   }, 30000);
+});
+
+describe('BufferPool page events', () => {
+  let pool: BufferPool;
+  let events: PageEvent[];
+
+  beforeEach(() => {
+    pool = new BufferPool(new MemDiskManager(), new MockLogManager(), 2);
+    events = [];
+  });
+
+  async function makePage(type: number | null): Promise<PageId> {
+    const [pid, buf] = await pool.newPage();
+    if (type !== null) buf.writeUInt8(type, 16);
+    pool.unpinPage(pid, true);
+    return pid;
+  }
+
+  async function touch(pid: PageId): Promise<void> {
+    await pool.fetchPage(pid);
+    pool.unpinPage(pid, false);
+  }
+
+  it('reports new, evict, flush, miss and hit with the page kind', async () => {
+    const fsm = await makePage(3);   // page 0
+    const leaf = await makePage(1);  // page 1
+    pool.onPageEvent = e => events.push(e);
+
+    const heap = await makePage(0);  // page 2 evicts page 0 (dirty)
+    expect(events).toEqual([
+      { type: 'evict', pageId: fsm, frame: 0, kind: 'fsm', dirty: true },
+      { type: 'flush', pageId: fsm, frame: 0, kind: 'fsm' },
+      { type: 'new', pageId: heap, frame: 0, kind: 'unknown' },
+    ]);
+
+    events = [];
+    await touch(heap);
+    await touch(fsm); // evicts the leaf, which is dirty
+    expect(events).toEqual([
+      { type: 'hit', pageId: heap, frame: 0, kind: 'heap' },
+      { type: 'evict', pageId: leaf, frame: 1, kind: 'btree-leaf', dirty: true },
+      { type: 'flush', pageId: leaf, frame: 1, kind: 'btree-leaf' },
+      { type: 'miss', pageId: fsm, frame: 1, kind: 'fsm' },
+    ]);
+
+    events = [];
+    const internal = await makePage(2);
+    await touch(internal);
+    await pool.flushAll();
+    expect(events.filter(e => e.type === 'hit')).toEqual([{ type: 'hit', pageId: internal, frame: 1, kind: 'btree-internal' }]);
+    expect(events.filter(e => e.type === 'evict')[0]).toMatchObject({ pageId: fsm, dirty: false });
+    expect(events.filter(e => e.type === 'flush')).toEqual([
+      { type: 'flush', pageId: heap, frame: 0, kind: 'heap' },
+      { type: 'flush', pageId: internal, frame: 1, kind: 'btree-internal' },
+    ]);
+  });
+
+  it('reports a flushPage write and snapshots every frame', async () => {
+    const fsm = await makePage(3);
+    const heap = await makePage(0);
+    await touch(fsm);
+    await pool.fetchPage(heap);
+    pool.onPageEvent = e => events.push(e);
+    await pool.flushPage(heap);
+    expect(events).toEqual([{ type: 'flush', pageId: heap, frame: 1, kind: 'heap' }]);
+
+    expect(pool.snapshot()).toEqual([
+      { frame: 0, pageId: fsm, pinCount: 0, dirty: true, kind: 'fsm' },
+      { frame: 1, pageId: heap, pinCount: 1, dirty: false, kind: 'heap' },
+    ]);
+    pool.unpinPage(heap, false);
+  });
+
+  it('snapshots empty frames as unknown', () => {
+    expect(pool.snapshot()).toEqual([
+      { frame: 0, pageId: -1, pinCount: 0, dirty: false, kind: 'unknown' },
+      { frame: 1, pageId: -1, pinCount: 0, dirty: false, kind: 'unknown' },
+    ]);
+  });
 });

@@ -1,8 +1,18 @@
-import type { IBufferPool, BufferPoolStats, ILogManager, IDiskManager } from '../common/interfaces.js';
+import type { IBufferPool, BufferPoolStats, ILogManager, IDiskManager, PageKind, PageEvent } from '../common/interfaces.js';
 import type { PageId, LSN } from '../common/types.js';
 import { INVALID_LSN } from '../common/types.js';
 import { PAGE_SIZE } from '../common/config.js';
 import { Page } from './Page.js';
+
+export type { PageKind, PageEvent } from '../common/interfaces.js';
+
+const KIND_BY_TYPE: readonly PageKind[] = ['heap', 'btree-leaf', 'btree-internal', 'fsm'];
+
+function pageKind(pageId: PageId, buf: Buffer): PageKind {
+  if (pageId === 0) return 'fsm';
+  return KIND_BY_TYPE[buf[16]!] ?? 'unknown';
+}
+
 interface Frame {
   pageId:     PageId;
   buffer:     Buffer;
@@ -18,6 +28,7 @@ export class BufferPool implements IBufferPool {
   private pageTable: Map<PageId, number>; // pageId -> frame index
   private currentTimestamp: number = 0;
   public K: number = 2;
+  public onPageEvent: ((e: PageEvent) => void) | null = null;
 
   private statsCounters: BufferPoolStats = {
     hits: 0,
@@ -100,30 +111,46 @@ export class BufferPool implements IBufferPool {
     return victimIndex;
   }
 
-  async fetchPage(pageId: PageId): Promise<Buffer> {
-    if (this.pageTable.has(pageId)) {
-      this.statsCounters.hits++;
-      const fi = this.pageTable.get(pageId)!;
-      this.frames[fi]!.pinCount++;
-      this.updateHistory(fi);
-      return this.frames[fi]!.buffer;
-    }
-
-    this.statsCounters.misses++;
+  /** Pick a frame to reuse, writing back and dropping the page it holds. */
+  private async evictVictim(): Promise<number> {
     const fi = this.selectVictim();
     const victim = this.frames[fi]!;
 
     if (victim.pageId !== -1) {
       this.statsCounters.evictions++;
+      if (this.onPageEvent !== null) {
+        this.onPageEvent({ type: 'evict', pageId: victim.pageId, frame: fi, kind: pageKind(victim.pageId, victim.buffer), dirty: victim.isDirty });
+      }
       if (victim.isDirty) {
         // WAL Rule: flush log up to victim's page LSN before evicting
         if (victim.pageLsn !== INVALID_LSN) {
           await this.logManager.flush(victim.pageLsn);
         }
         await this.diskManager.writePage(victim.pageId, victim.buffer);
+        if (this.onPageEvent !== null) {
+          this.onPageEvent({ type: 'flush', pageId: victim.pageId, frame: fi, kind: pageKind(victim.pageId, victim.buffer) });
+        }
       }
       this.pageTable.delete(victim.pageId);
     }
+    return fi;
+  }
+
+  async fetchPage(pageId: PageId): Promise<Buffer> {
+    if (this.pageTable.has(pageId)) {
+      this.statsCounters.hits++;
+      const fi = this.pageTable.get(pageId)!;
+      this.frames[fi]!.pinCount++;
+      this.updateHistory(fi);
+      if (this.onPageEvent !== null) {
+        this.onPageEvent({ type: 'hit', pageId, frame: fi, kind: pageKind(pageId, this.frames[fi]!.buffer) });
+      }
+      return this.frames[fi]!.buffer;
+    }
+
+    this.statsCounters.misses++;
+    const fi = await this.evictVictim();
+    const victim = this.frames[fi]!;
 
     await this.diskManager.readPage(pageId, victim.buffer);
     victim.pageId = pageId;
@@ -134,24 +161,16 @@ export class BufferPool implements IBufferPool {
     victim.accessHistory = [];
     this.pageTable.set(pageId, fi);
     this.updateHistory(fi);
+    if (this.onPageEvent !== null) {
+      this.onPageEvent({ type: 'miss', pageId, frame: fi, kind: pageKind(pageId, victim.buffer) });
+    }
 
     return victim.buffer;
   }
 
   async newPage(): Promise<[PageId, Buffer]> {
-    const fi = this.selectVictim();
+    const fi = await this.evictVictim();
     const victim = this.frames[fi]!;
-
-    if (victim.pageId !== -1) {
-      this.statsCounters.evictions++;
-      if (victim.isDirty) {
-        if (victim.pageLsn !== INVALID_LSN) {
-          await this.logManager.flush(victim.pageLsn);
-        }
-        await this.diskManager.writePage(victim.pageId, victim.buffer);
-      }
-      this.pageTable.delete(victim.pageId);
-    }
 
     const pageId = await this.diskManager.allocatePage();
     // buffer is already zeroed by allocatePage, but we zero our in-memory buffer too
@@ -164,6 +183,9 @@ export class BufferPool implements IBufferPool {
     victim.accessHistory = [];
     this.pageTable.set(pageId, fi);
     this.updateHistory(fi);
+    if (this.onPageEvent !== null) {
+      this.onPageEvent({ type: 'new', pageId, frame: fi, kind: 'unknown' });
+    }
 
     return [pageId, victim.buffer];
   }
@@ -192,6 +214,9 @@ export class BufferPool implements IBufferPool {
       await this.diskManager.writePage(frame.pageId, frame.buffer);
       frame.isDirty = false;
       frame.recLsn = INVALID_LSN;
+      if (this.onPageEvent !== null) {
+        this.onPageEvent({ type: 'flush', pageId, frame: fi, kind: pageKind(pageId, frame.buffer) });
+      }
     }
   }
 
@@ -205,6 +230,9 @@ export class BufferPool implements IBufferPool {
         await this.diskManager.writePage(frame.pageId, frame.buffer);
         frame.isDirty = false;
         frame.recLsn = INVALID_LSN;
+        if (this.onPageEvent !== null) {
+          this.onPageEvent({ type: 'flush', pageId: frame.pageId, frame: i, kind: pageKind(frame.pageId, frame.buffer) });
+        }
       }
     }
   }
@@ -236,6 +264,17 @@ export class BufferPool implements IBufferPool {
     const totalRequests = this.statsCounters.hits + this.statsCounters.misses;
     this.statsCounters.hitRatio = totalRequests > 0 ? this.statsCounters.hits / totalRequests : 0;
     return { ...this.statsCounters };
+  }
+
+  /** Every frame's current contents, empty frames included (pageId -1). */
+  snapshot(): Array<{ frame: number; pageId: number; pinCount: number; dirty: boolean; kind: PageKind }> {
+    return this.frames.map((f, frame) => ({
+      frame,
+      pageId: f.pageId,
+      pinCount: f.pinCount,
+      dirty: f.isDirty,
+      kind: f.pageId === -1 ? 'unknown' : pageKind(f.pageId, f.buffer),
+    }));
   }
 
   getDirtyPageTable(): Map<PageId, LSN> {

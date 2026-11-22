@@ -171,6 +171,8 @@ describe('SQL correctness', () => {
       await expect(db.execute("INSERT INTO t (label) VALUES ('x')")).rejects.toThrow(/Column 'id' cannot be NULL/);
       await expect(db.execute("INSERT INTO t VALUES (NULL, 'x')")).rejects.toThrow(/Column 'id' cannot be NULL/);
       await expect(db.execute('INSERT INTO t (id, id) VALUES (1, 2)')).rejects.toThrow(/listed more than once/);
+      await expect(db.execute("INSERT INTO t VALUES (1, 'longer than ten')")).rejects.toThrow(/longer than VARCHAR\(10\)/);
+      await expect(db.execute("INSERT INTO t VALUES (3000000000, 'x')")).rejects.toThrow(/out of range for INT/);
       expect((await db.execute('SELECT * FROM t')).rows).toEqual([]);
     });
   });

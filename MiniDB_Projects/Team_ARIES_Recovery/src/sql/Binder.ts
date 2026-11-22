@@ -1,5 +1,5 @@
 import type { ICatalog, CatalogEntry } from '../common/interfaces.js';
-import type { TableId } from '../common/types.js';
+import type { TableId, ColumnDef } from '../common/types.js';
 import type { 
   Statement, Expression, Projection, SelectStmt, InsertStmt, DeleteStmt
 } from './AST.js';
@@ -173,6 +173,7 @@ export class Binder {
         const expectedType = entry.schema[colIndices[i]!]!.type;
         // Strict type checking for inserts
         this.checkType(boundVal, expectedType);
+        this.checkFits(entry.schema[colIndices[i]!]!, boundVal);
         boundRow[colIndices[i]!] = boundVal;
       });
       entry.schema.forEach((col, i) => {
@@ -315,6 +316,18 @@ export class Binder {
     if (typeof val === 'string') return 'VARCHAR';
     if (typeof val === 'boolean') return 'BOOL';
     return 'UNKNOWN'; // NULL
+  }
+
+  /** Values that don't fit the column's on-disk size would be rejected or overflow the index key slot. */
+  private checkFits(col: ColumnDef, expr: BoundExpression) {
+    if (expr.kind !== 'bound_literal' || expr.value === null) return;
+    if (col.type === 'INT' && typeof expr.value === 'number' && (expr.value < -2147483648 || expr.value > 2147483647)) {
+      throw new TypeError(`Value ${expr.value} is out of range for INT column '${col.name}'`);
+    }
+    const maxLen = col.maxLen ?? 255;
+    if (col.type === 'VARCHAR' && Buffer.byteLength(String(expr.value), 'utf8') > maxLen) {
+      throw new TypeError(`Value for '${col.name}' is longer than VARCHAR(${maxLen})`);
+    }
   }
 
   private checkType(expr: BoundExpression, expected: string) {

@@ -128,13 +128,22 @@ export class MiniDB {
         if (stmt.analyze) {
           const root = this.executor.buildOperatorTree(physicalPlan);
           await root.open(ctx);
-          while (await root.next()) {} // exhaust
-          await root.close();
-          const tree = this.executor.explainAnalyzeTree(root);
-          result = { columns: ['EXPLAIN ANALYZE'], rows: [[tree]] };
+          try {
+            while (await root.next()) {} // exhaust
+          } finally {
+            await root.close();
+          }
+          result = {
+            columns: ['EXPLAIN ANALYZE'],
+            rows: [[this.executor.explainAnalyzeTree(root)]],
+            plan: this.executor.explainAnalyzePlan(root),
+          };
         } else {
-          const tree = this.executor.explainTree(physicalPlan);
-          result = { columns: ['EXPLAIN'], rows: [[tree]] };
+          result = {
+            columns: ['EXPLAIN'],
+            rows: [[this.executor.explainTree(physicalPlan)]],
+            plan: this.executor.explainPlan(physicalPlan),
+          };
         }
       } else if (stmt.kind === 'analyze') {
         const entry = this.catalog.getTable(stmt.table as any);

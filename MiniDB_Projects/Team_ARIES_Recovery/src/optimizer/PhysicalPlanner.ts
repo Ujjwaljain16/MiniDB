@@ -3,7 +3,9 @@ import type { PhysicalNode, PhysSeqScan, PhysIndexScan, PhysFilter, PhysProject,
 import type { ICatalog, TableStats, CatalogEntry } from '../common/interfaces.js';
 import { seqScanCost, indexScanCost, estimateSelectivity } from './CostModel.js';
 import { JoinOrderer, JoinNode } from './JoinOrderer.js';
-import type { TableId } from '../common/types.js';
+import { indexRange, andAll } from './Predicates.js';
+import { compareKeys } from '../index/BPlusKeyUtils.js';
+import type { TableId, IndexId, ColValue } from '../common/types.js';
 
 export class PhysicalPlanner {
   constructor(private catalog: ICatalog) {}
@@ -27,7 +29,12 @@ export class PhysicalPlanner {
     }
   }
 
-  private planScan(node: LogicalScan, pushedPredicate?: BoundExpression): PhysicalNode {
+  /**
+   * Picks a seq scan or an index scan for `node`. `conjuncts` are AND-ed
+   * predicates on this table; the index scan uses those on its key column to
+   * bound the range, but the caller must still filter on all of them.
+   */
+  private planScan(node: LogicalScan, conjuncts: BoundExpression[] = []): PhysicalNode {
     const entry = this.catalog.getTable(node.tableId);
     let stats: TableStats;
     try {
@@ -52,46 +59,41 @@ export class PhysicalPlanner {
       estCost: seqCost
     } as PhysSeqScan;
 
-    // Check if we can use an index based on the pushed predicate
-    if (pushedPredicate && pushedPredicate.kind === 'bound_binary') {
-      const left = pushedPredicate.left;
-      const right = pushedPredicate.right;
+    const ref = node.alias ?? (node.tableId as string);
+    for (const [idxName, idxDef] of Object.entries(entry.indexes)) {
+      const colDef = entry.schema.find(c => c.name === idxDef.column);
+      if (!colDef) continue;
 
-      let colName: string | undefined;
-      
-      if (left.kind === 'bound_col' && right.kind === 'bound_literal') {
-        if (!left.tableAlias || left.tableAlias === node.alias || left.tableAlias === node.tableId) {
-          colName = left.columnName;
-        }
-      } else if (right.kind === 'bound_col' && left.kind === 'bound_literal') {
-        if (!right.tableAlias || right.tableAlias === node.alias || right.tableAlias === node.tableId) {
-          colName = right.columnName;
-        }
+      const keyConds: BoundExpression[] = [];
+      let low: ColValue | null = null;
+      let high: ColValue | null = null;
+      for (const conj of conjuncts) {
+        const range = indexRange(conj, idxDef.column, ref);
+        if (!range) continue;
+        keyConds.push(conj);
+        if (range.low !== null && (low === null || compareKeys(range.low, low, colDef) > 0)) low = range.low;
+        if (range.high !== null && (high === null || compareKeys(range.high, high, colDef) < 0)) high = range.high;
       }
+      if (keyConds.length === 0) continue;
 
-      if (colName) {
-        // Find if an index exists on this column
-        for (const [idxName, idxDef] of Object.entries(entry.indexes)) {
-          if (idxDef.column === colName) {
-            // Index available!
-            const selectivity = estimateSelectivity(pushedPredicate, stats);
-            const idxCost = indexScanCost(stats.rowCount, selectivity);
-            
-            if (idxCost < bestCost) {
-              bestCost = idxCost;
-              bestPlan = {
-                kind: 'phys_index_scan',
-                tableId: node.tableId,
-                indexId: idxName as any,
-                schema: node.schema,
-                alias: node.alias,
-                keyCondition: pushedPredicate,
-                estRows: Math.ceil(stats.rowCount * selectivity),
-                estCost: idxCost
-              } as PhysIndexScan;
-            }
-          }
-        }
+      const keyCondition = andAll(keyConds);
+      const selectivity = estimateSelectivity(keyCondition, stats);
+      const idxCost = indexScanCost(stats.rowCount, selectivity);
+      if (idxCost < bestCost) {
+        bestCost = idxCost;
+        bestPlan = {
+          kind: 'phys_index_scan',
+          tableId: node.tableId,
+          indexId: idxName as IndexId,
+          schema: node.schema,
+          alias: node.alias,
+          keyColumn: idxDef.column,
+          keyCondition,
+          lowKey: low,
+          highKey: high,
+          estRows: Math.ceil(stats.rowCount * selectivity),
+          estCost: idxCost
+        } as PhysIndexScan;
       }
     }
 
@@ -101,15 +103,10 @@ export class PhysicalPlanner {
   private planFilter(node: LogicalFilter): PhysicalNode {
     if (node.child.kind === 'scan') {
       // Try to push the predicate down into the scan to trigger an index scan
-      const scanNode = this.planScan(node.child as LogicalScan, node.predicate);
-      
+      const scanNode = this.planScan(node.child as LogicalScan, [node.predicate]);
+
       if (scanNode.kind === 'phys_index_scan') {
-        // The index scan inherently filters on this predicate
-        // However, if there are other conditions in the predicate (e.g. AND), we might still need a filter.
-        // For simplicity, if it became an index scan, we assume the index condition handles it.
-        // But what if it's `id = 5 AND age > 20`? 
-        // We should just wrap the index scan with the filter anyway. The index scan will return fewer rows.
-        // We'll wrap it for safety unless the engine natively drops the evaluated condition.
+        // The index range is only a superset of the matches, so the full predicate stays on top.
         const estRows = scanNode.estRows; // filter further reduces it, but let's keep it simple
         const estCost = scanNode.estCost;
         return {

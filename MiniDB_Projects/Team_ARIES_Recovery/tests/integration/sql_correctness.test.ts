@@ -57,6 +57,40 @@ describe('SQL correctness', () => {
     });
   });
 
+  describe('index range predicates', () => {
+    const cases: Array<[string, (r: Row) => boolean]> = [
+      ['id > 1995', r => r.id > 1995],
+      ['id >= 1995', r => r.id >= 1995],
+      ['id < 5', r => r.id < 5],
+      ['id <= 5', r => r.id <= 5],
+      ['id = 1000', r => r.id === 1000],
+      ['1995 < id', r => 1995 < r.id],
+      ['5 >= id', r => 5 >= r.id],
+      ['id > 100 AND id <= 110', r => r.id > 100 && r.id <= 110],
+      ['id > 10 AND id < 5', () => false],
+      ['id > 2000', () => false],
+      ['id != 5', r => r.id !== 5],
+      ['id = 7 AND age > 20', r => r.id === 7 && r.age > 20],
+    ];
+
+    it('match a brute-force scan after ANALYZE', async () => {
+      const rows = await loadUsers(2000);
+      await db.execute('ANALYZE users');
+      for (const [where, pred] of cases) {
+        const expected = rows.filter(pred).map(r => r.id);
+        expect({ where, ids: await ids(`SELECT id FROM users WHERE ${where}`) }).toEqual({ where, ids: expected });
+      }
+      expect(db.bufferPool.stats().pinnedPages).toBe(0);
+    });
+
+    it('use the index for a selective open range', async () => {
+      await loadUsers(2000);
+      await db.execute('ANALYZE users');
+      const explain = await db.execute('EXPLAIN SELECT * FROM users WHERE id > 1995');
+      expect(String(explain.rows[0]![0])).toContain('phys_index_scan');
+    });
+  });
+
   describe('unsupported SQL fails with a clear error', () => {
     beforeEach(async () => {
       await loadUsers(5);

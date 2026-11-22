@@ -70,7 +70,12 @@ export class BPlusTree implements IBPlusTree {
     }
   }
 
-  async *searchRange(low: ColValue, high: ColValue): AsyncIterableIterator<RID> {
+  /**
+   * Yields RIDs with `low <= key <= high` in key order. A null bound is open:
+   * null `low` starts at the leftmost leaf, null `high` runs to the last leaf.
+   * Stopping the iterator early (return()) unpins the leaf it was on.
+   */
+  async *searchRange(low: ColValue | null, high: ColValue | null): AsyncIterableIterator<RID> {
     if (this._rootPageId === NULL_PAGE_ID) return;
 
     let pageId = this._rootPageId;
@@ -79,10 +84,10 @@ export class BPlusTree implements IBPlusTree {
     try {
       while (true) {
         currentNode = await this.fetchNode(pageId);
-        
+
         if (currentNode.isLeaf) break;
-        
-        const childIdx = currentNode.findChildIndex(low);
+
+        const childIdx = low === null ? 0 : this.lowerBoundChild(currentNode, low);
         const childId = currentNode.getChildId(childIdx);
         this.bufferPool.unpinPage(pageId, false);
         currentNode = null;
@@ -92,18 +97,16 @@ export class BPlusTree implements IBPlusTree {
       while (pageId !== NULL_PAGE_ID && currentNode) {
         const n = currentNode.numKeys;
         let done = false;
-        
+
         for (let i = 0; i < n; i++) {
           const { key, rid } = currentNode.getLeafEntry(i);
-          const cmpLow = compareKeys(key, low, this.colDef);
-          const cmpHigh = compareKeys(key, high, this.colDef);
-          
-          if (cmpHigh > 0) {
+
+          if (high !== null && compareKeys(key, high, this.colDef) > 0) {
             done = true;
             break;
           }
-          
-          if (cmpLow >= 0) {
+
+          if (low === null || compareKeys(key, low, this.colDef) >= 0) {
             yield rid;
           }
         }
@@ -128,6 +131,22 @@ export class BPlusTree implements IBPlusTree {
         this.bufferPool.unpinPage(currentNode.pageId, false);
       }
     }
+  }
+
+  /**
+   * First child that can hold `key`. Unlike findChildIndex this goes left on a
+   * separator equal to `key`, because a leaf split can leave duplicates of the
+   * separator at the end of the left sibling.
+   */
+  private lowerBoundChild(node: BPlusNode, key: ColValue): number {
+    let lo = 0;
+    let hi = node.numKeys;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (compareKeys(key, node.getInternalKey(mid), this.colDef) <= 0) hi = mid;
+      else lo = mid + 1;
+    }
+    return lo;
   }
 
   async insert(key: ColValue, rid: RID): Promise<void> {

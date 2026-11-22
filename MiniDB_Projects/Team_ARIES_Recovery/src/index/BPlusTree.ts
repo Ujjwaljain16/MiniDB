@@ -134,6 +134,52 @@ export class BPlusTree implements IBPlusTree {
   }
 
   /**
+   * Snapshot of every node, breadth-first from the root, for visualisation.
+   * Leaves have no children; internal nodes have nextLeafId = -1.
+   */
+  async describe(): Promise<{
+    rootPageId: number;
+    height: number;
+    nodes: Array<{ pageId: number; isLeaf: boolean; keys: (number | string | boolean | null)[]; children: number[]; nextLeafId: number }>;
+  }> {
+    const nodes: Array<{ pageId: number; isLeaf: boolean; keys: (number | string | boolean | null)[]; children: number[]; nextLeafId: number }> = [];
+    let height = 0;
+    let level: PageId[] = this._rootPageId === NULL_PAGE_ID ? [] : [this._rootPageId];
+
+    while (level.length > 0) {
+      height++;
+      const nextLevel: PageId[] = [];
+      for (const pageId of level) {
+        const node = await this.fetchNode(pageId);
+        try {
+          const keys: (number | string | boolean | null)[] = [];
+          const children: number[] = [];
+          for (let i = 0; i < node.numKeys; i++) {
+            const key = node.isLeaf ? node.getLeafEntry(i).key : node.getInternalKey(i);
+            keys.push(typeof key === 'bigint' ? key.toString() : key);
+          }
+          if (!node.isLeaf) {
+            for (let i = 0; i <= node.numKeys; i++) children.push(node.getChildId(i));
+            nextLevel.push(...(children as PageId[]));
+          }
+          nodes.push({
+            pageId,
+            isLeaf: node.isLeaf,
+            keys,
+            children,
+            nextLeafId: node.isLeaf ? node.nextLeafId : NULL_PAGE_ID,
+          });
+        } finally {
+          this.bufferPool.unpinPage(pageId, false);
+        }
+      }
+      level = nextLevel;
+    }
+
+    return { rootPageId: this._rootPageId, height, nodes };
+  }
+
+  /**
    * First child that can hold `key`. Unlike findChildIndex this goes left on a
    * separator equal to `key`, because a leaf split can leave duplicates of the
    * separator at the end of the left sibling.

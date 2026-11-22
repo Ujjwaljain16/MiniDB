@@ -145,6 +145,18 @@ describe('SQL correctness', () => {
     });
   });
 
+  describe('B+ tree inspection', () => {
+    it('describes the index built through SQL and leaves nothing pinned', async () => {
+      await loadUsers(1500);
+      const tree = db.catalog.getTable('users' as any).indexes['idx_id' as any]!.tree;
+      const d = await tree.describe();
+      expect(d.height).toBeGreaterThan(1);
+      expect(d.nodes.filter((n: { isLeaf: boolean }) => n.isLeaf).flatMap((n: { keys: number[] }) => n.keys))
+        .toEqual(Array.from({ length: 1500 }, (_, i) => i + 1));
+      expect(db.bufferPool.stats().pinnedPages).toBe(0);
+    });
+  });
+
   describe('column names', () => {
     it('uses the alias, else the column name, qualified only for aliased tables', async () => {
       await loadUsers(5);

@@ -65,6 +65,29 @@ describe('BPlusTree range scans', () => {
     expect(pool.stats().pinnedPages).toBe(0);
   });
 
+  it('describes every node breadth-first and unpins them', async () => {
+    expect(await tree.describe()).toEqual({ rootPageId: -1, height: 0, nodes: [] });
+
+    for (let i = 1; i <= 3000; i++) await tree.insert(i, makeRID(0, i));
+    const d = await tree.describe();
+    expect(d.rootPageId).toBe(tree.rootPageId());
+    expect(d.height).toBe(await tree.height());
+    expect(d.nodes[0]!.pageId).toBe(d.rootPageId);
+    expect(d.nodes[0]!.isLeaf).toBe(false);
+
+    const leaves = d.nodes.filter(n => n.isLeaf);
+    expect(leaves.flatMap(n => n.keys)).toEqual(Array.from({ length: 3000 }, (_, i) => i + 1));
+    leaves.forEach((leaf, i) => {
+      expect(leaf.children).toEqual([]);
+      expect(leaf.nextLeafId).toBe(i + 1 < leaves.length ? leaves[i + 1]!.pageId : -1);
+    });
+    for (const n of d.nodes.filter(n => !n.isLeaf)) {
+      expect(n.children.length).toBe(n.keys.length + 1);
+      expect(n.nextLeafId).toBe(-1);
+    }
+    expect(pool.stats().pinnedPages).toBe(0);
+  });
+
   it('unpins the current leaf when the consumer stops early', async () => {
     for (let i = 1; i <= 2000; i++) await tree.insert(i, makeRID(0, i));
     let seen = 0;

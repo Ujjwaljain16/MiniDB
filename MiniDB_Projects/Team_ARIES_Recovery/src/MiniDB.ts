@@ -1,8 +1,13 @@
 import path from 'path';
 import { DiskManager } from './storage/DiskManager.js';
+import { MemDiskManager } from './storage/MemDiskManager.js';
 import { LogManager } from './recovery/LogManager.js';
+import { MemLogManager } from './recovery/MemLogManager.js';
 import { BufferPool } from './storage/BufferPool.js';
+import { ensureFsmPage } from './storage/HeapFile.js';
 import { JSONCatalogStorage } from './catalog/JSONCatalogStorage.js';
+import { MemCatalogStorage } from './catalog/MemCatalogStorage.js';
+import type { CatalogStorage } from './catalog/CatalogStorage.js';
 import { Catalog } from './catalog/Catalog.js';
 import { LockManager } from './concurrency/LockManager.js';
 import { TxnManager } from './concurrency/TxnManager.js';
@@ -13,10 +18,12 @@ import { Binder } from './sql/Binder.js';
 import { PhysicalPlanner } from './optimizer/PhysicalPlanner.js';
 import { Executor } from './execution/Executor.js';
 import type { TxnId, ResultSet } from './common/types.js';
+import type { IDiskManager, ILogManager } from './common/interfaces.js';
+import { POOL_SIZE } from './common/config.js';
 
 export class MiniDB {
-  public diskManager!: DiskManager;
-  public logManager!: LogManager;
+  public diskManager!: IDiskManager;
+  public logManager!: ILogManager;
   public bufferPool!: BufferPool;
   public catalog!: Catalog;
   public lockManager!: LockManager;
@@ -36,35 +43,46 @@ export class MiniDB {
     const walPath = path.join(this.dataDir, 'wal.log');
     const catalogPath = path.join(this.dataDir, 'catalog.json');
 
-    // 1. Storage & Logging
-    this.diskManager = await DiskManager.open(dbPath);
-    this.logManager = new LogManager(walPath);
-    await this.logManager.init();
-    
-    this.bufferPool = new BufferPool(this.diskManager, this.logManager, this.poolSize);
+    const diskManager = await DiskManager.open(dbPath);
+    const logManager = new LogManager(walPath);
+    await logManager.init();
+    await this.setup(diskManager, logManager, new JSONCatalogStorage(catalogPath));
 
-    // 2. Catalog
-    const catalogStorage = new JSONCatalogStorage(catalogPath);
-    this.catalog = new Catalog(catalogStorage, this.bufferPool, this.diskManager);
-    await this.catalog.load();
-
-    // 3. Concurrency
-    this.lockManager = new LockManager();
-    this.txnManager = new TxnManager(this.lockManager, this.logManager);
-
-    // 4. Recovery
+    // The catalog is loaded first so pages re-created by redo get their table's heapId
     await recover(this.logManager, this.bufferPool, this.txnManager, this.dataDir, tableId => this.catalog.heapIdOf(tableId));
 
-    // 5. Background Tasks
     this.deadlockDetector = new DeadlockDetector(this.lockManager, this.txnManager);
     this.deadlockDetector.start();
 
-    // 6. SQL Layer
+    this.isAcceptingQueries = true;
+  }
+
+  /**
+   * An opened database that lives entirely in memory: no file system, no
+   * recovery and no deadlock-detector timer, so it also runs in a browser.
+   */
+  static async inMemory(opts: { poolSize?: number } = {}): Promise<MiniDB> {
+    const db = new MiniDB(':memory:', opts.poolSize ?? POOL_SIZE);
+    await db.setup(new MemDiskManager(), new MemLogManager(), new MemCatalogStorage());
+    db.isAcceptingQueries = true;
+    return db;
+  }
+
+  private async setup(diskManager: IDiskManager, logManager: ILogManager, catalogStorage: CatalogStorage): Promise<void> {
+    this.diskManager = diskManager;
+    this.logManager = logManager;
+    this.bufferPool = new BufferPool(diskManager, logManager, this.poolSize);
+    await ensureFsmPage(this.bufferPool, diskManager);
+
+    this.catalog = new Catalog(catalogStorage, this.bufferPool, diskManager);
+    await this.catalog.load();
+
+    this.lockManager = new LockManager();
+    this.txnManager = new TxnManager(this.lockManager, logManager);
+
     this.binder = new Binder(this.catalog);
     this.planner = new PhysicalPlanner(this.catalog);
     this.executor = new Executor();
-
-    this.isAcceptingQueries = true;
   }
 
   async execute(input: string, txnId?: TxnId): Promise<ResultSet> {

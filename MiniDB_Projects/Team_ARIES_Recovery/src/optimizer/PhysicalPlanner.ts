@@ -3,7 +3,7 @@ import type { PhysicalNode, PhysSeqScan, PhysIndexScan, PhysFilter, PhysProject,
 import type { ICatalog, TableStats, CatalogEntry } from '../common/interfaces.js';
 import { seqScanCost, indexScanCost, estimateSelectivity } from './CostModel.js';
 import { JoinOrderer, JoinNode } from './JoinOrderer.js';
-import { indexRange, andAll } from './Predicates.js';
+import { indexRange, andAll, splitConjuncts } from './Predicates.js';
 import { compareKeys } from '../index/BPlusKeyUtils.js';
 import type { TableId, IndexId, ColValue } from '../common/types.js';
 
@@ -103,7 +103,7 @@ export class PhysicalPlanner {
   private planFilter(node: LogicalFilter): PhysicalNode {
     if (node.child.kind === 'scan') {
       // Try to push the predicate down into the scan to trigger an index scan
-      const scanNode = this.planScan(node.child as LogicalScan, [node.predicate]);
+      const scanNode = this.planScan(node.child as LogicalScan, splitConjuncts(node.predicate));
 
       if (scanNode.kind === 'phys_index_scan') {
         // The index range is only a superset of the matches, so the full predicate stays on top.

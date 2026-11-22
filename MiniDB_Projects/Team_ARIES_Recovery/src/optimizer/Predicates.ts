@@ -6,6 +6,14 @@ export function columnRef(col: BoundColumnRef): string {
   return col.tableAlias ?? (col.tableId as string);
 }
 
+/** Flatten nested ANDs into their conjuncts. */
+export function splitConjuncts(pred: BoundExpression): BoundExpression[] {
+  if (pred.kind === 'bound_logical' && pred.op === 'AND') {
+    return [...splitConjuncts(pred.left), ...splitConjuncts(pred.right)];
+  }
+  return [pred];
+}
+
 /** AND together a non-empty list of predicates. */
 export function andAll(preds: BoundExpression[]): BoundExpression {
   return preds.reduce((acc, p) => ({ kind: 'bound_logical', op: 'AND', left: acc, right: p }));

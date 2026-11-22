@@ -89,6 +89,13 @@ describe('SQL correctness', () => {
       const explain = await db.execute('EXPLAIN SELECT * FROM users WHERE id > 1995');
       expect(String(explain.rows[0]![0])).toContain('phys_index_scan');
     });
+
+    it('use the index for one conjunct of an AND', async () => {
+      await loadUsers(2000);
+      await db.execute('ANALYZE users');
+      const explain = await db.execute('EXPLAIN SELECT * FROM users WHERE id = 5 AND age > 20');
+      expect(String(explain.rows[0]![0])).toContain('phys_index_scan');
+    });
   });
 
   describe('unsupported SQL fails with a clear error', () => {

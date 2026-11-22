@@ -76,6 +76,34 @@ describe('PhysicalPlanner & Explain', () => {
     expect(explain).toContain('rows=~1');
   });
 
+  it('uses the index for one conjunct of an AND and keeps the full predicate on top', () => {
+    const logicalPlan = new Binder(catalog).bind(parseSQL('SELECT * FROM users WHERE age > 20 AND id = 42'));
+    const physicalPlan = new PhysicalPlanner(catalog).plan(logicalPlan) as any;
+
+    expect(physicalPlan.kind).toBe('phys_project');
+    const filter = physicalPlan.child;
+    expect(filter.kind).toBe('phys_filter');
+    expect(filter.predicate.kind).toBe('bound_logical');
+    expect(filter.child.kind).toBe('phys_index_scan');
+    expect(filter.child.lowKey).toBe(42);
+    expect(filter.child.highKey).toBe(42);
+  });
+
+  it('intersects range conjuncts on the indexed column', () => {
+    const logicalPlan = new Binder(catalog).bind(parseSQL('SELECT * FROM users WHERE id > 10 AND 20 >= id AND id >= 12'));
+    const scan = (new PhysicalPlanner(catalog).plan(logicalPlan) as any).child.child;
+    expect(scan.kind).toBe('phys_index_scan');
+    expect(scan.lowKey).toBe(12);
+    expect(scan.highKey).toBe(20);
+  });
+
+  it('never uses the index for != or LIKE', () => {
+    for (const where of ['id != 42', 'id <> 42', "name LIKE 'a%'"]) {
+      const logicalPlan = new Binder(catalog).bind(parseSQL(`SELECT * FROM users WHERE ${where}`));
+      expect(explainTree(new PhysicalPlanner(catalog).plan(logicalPlan))).not.toContain('phys_index_scan');
+    }
+  });
+
   it('plans a SeqScan when no index is available', () => {
     const ast = parseSQL('SELECT * FROM users WHERE age = 42');
     const binder = new Binder(catalog);

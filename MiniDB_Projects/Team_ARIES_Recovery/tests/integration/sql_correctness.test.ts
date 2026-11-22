@@ -50,6 +50,17 @@ describe('SQL correctness', () => {
       expect(await ids('SELECT id FROM users WHERE (id < 10 OR id > 190) AND age > 25')).toEqual(expected);
     });
 
+    it('evaluates LIKE with % and _ and ignores case', async () => {
+      const rows = await loadUsers(150, { indexOn: ['id', 'name'] });
+      const like = (re: RegExp) => rows.filter(r => re.test(r.name)).map(r => r.id);
+      expect(await ids("SELECT id FROM users WHERE name LIKE 'u1%'")).toEqual(like(/^u1/));
+      expect(await ids("SELECT id FROM users WHERE name LIKE 'U_'")).toEqual(like(/^u.$/));
+      expect(await ids("SELECT id FROM users WHERE name LIKE '%5' AND id > 50")).toEqual(rows.filter(r => /5$/.test(r.name) && r.id > 50).map(r => r.id));
+      expect(await ids("SELECT id FROM users WHERE name LIKE 'u1.%'")).toEqual([]);
+      const explain = await db.execute("EXPLAIN SELECT id FROM users WHERE name LIKE 'u1'");
+      expect(String(explain.rows[0]![0])).not.toContain('phys_index_scan');
+    });
+
     it('accepts negative literals and the == and <> spellings', async () => {
       const rows = await loadUsers(50);
       expect(await ids('SELECT id FROM users WHERE id > -5 AND id == 7')).toEqual([7]);

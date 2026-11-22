@@ -1,8 +1,9 @@
 import { HeapFile, serializeTuple, deserializeTuple } from '../../../src/storage/HeapFile';
 import { DiskManager } from '../../../src/storage/DiskManager';
 import { BufferPool } from '../../../src/storage/BufferPool';
+import { MemDiskManager } from '../../../src/storage/MemDiskManager';
 import type { ILogManager, LogRecord } from '../../../src/common/interfaces';
-import type { Schema, LSN } from '../../../src/common/types';
+import type { Schema, LSN, PageId } from '../../../src/common/types';
 import { INVALID_LSN, makeRID } from '../../../src/common/types';
 import * as fs from 'fs/promises';
 import * as path from 'path';
@@ -126,5 +127,63 @@ describe('HeapFile', () => {
     let count = 0;
     for await (const _ of hf.scan(schema)) count++;
     expect(count).toBe(301);
+  });
+});
+
+describe('HeapFile with several heaps in one data file', () => {
+  const schema: Schema = [
+    { name: 'id', type: 'INT', nullable: false },
+    { name: 'name', type: 'VARCHAR', nullable: false }
+  ];
+
+  it('scans and fills only its own pages', async () => {
+    const dm = new MemDiskManager();
+    const bp = new BufferPool(dm, new MockLogManager(), 4);
+    const a = new HeapFile('a', bp, dm, 1, []);
+    const b = new HeapFile('b', bp, dm, 2, []);
+
+    const pad = 'p'.repeat(300);
+    const ridsA = [];
+    for (let i = 0; i < 40; i++) {
+      ridsA.push(await a.insertTuple([i, pad], schema));
+      await b.insertTuple([1000 + i, 'b'], schema);
+    }
+    await a.deleteTuple(ridsA[3]!);
+    await b.insertTuple([2000, 'b'], schema);
+
+    const pagesA = new Set(ridsA.map(r => r.pageId));
+    const fetched: number[] = [];
+    bp.onPageEvent = e => { if (e.type === 'hit' || e.type === 'miss') fetched.push(e.pageId); };
+    const idsA = [];
+    for await (const [, t] of a.scan(schema)) idsA.push(t[0]);
+    expect(idsA).toEqual([...Array(40).keys()].filter(i => i !== 3));
+    expect(fetched.every(p => pagesA.has(p as PageId))).toBe(true);
+    bp.onPageEvent = null;
+
+    const idsB = [];
+    for await (const [rid, t] of b.scan(schema)) {
+      expect(pagesA.has(rid.pageId)).toBe(false);
+      idsB.push(t[0]);
+    }
+    expect(idsB).toEqual([...[...Array(40).keys()].map(i => 1000 + i), 2000]);
+
+    // A heap opened later finds its pages from the page owners
+    const again = new HeapFile('b', bp, dm, 2);
+    let count = 0;
+    for await (const _ of again.scan(schema)) count++;
+    expect(count).toBe(41);
+  });
+
+  it('disowns its pages when released', async () => {
+    const dm = new MemDiskManager();
+    const bp = new BufferPool(dm, new MockLogManager(), 4);
+    const a = new HeapFile('a', bp, dm, 1, []);
+    for (let i = 0; i < 5; i++) await a.insertTuple([i, 'x'], schema);
+    await a.releasePages();
+
+    const reused = new HeapFile('a2', bp, dm, 1);
+    let count = 0;
+    for await (const _ of reused.scan(schema)) count++;
+    expect(count).toBe(0);
   });
 });

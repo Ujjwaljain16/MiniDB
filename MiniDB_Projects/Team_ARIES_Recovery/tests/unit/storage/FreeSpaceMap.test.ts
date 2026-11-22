@@ -53,4 +53,16 @@ describe('FreeSpaceMap', () => {
     const p = await fsm.findFreePage(100, 1);
     expect(p).toBeNull(); // page 0 is not returned
   });
+
+  it('only considers the given pages', async () => {
+    await fsm.updateFreeSpace(1 as PageId, 3000);
+    await fsm.updateFreeSpace(2 as PageId, 100);
+    await fsm.updateFreeSpace(3 as PageId, 500);
+
+    expect(await fsm.findFreePageAmong(200, [2, 3] as PageId[])).toBe(3);
+    expect(await fsm.findFreePageAmong(200, [2] as PageId[])).toBeNull();
+    expect(await fsm.findFreePageAmong(80, [3, 2] as PageId[])).toBe(3); // first match in the given order
+    expect(await fsm.findFreePageAmong(10, [0] as PageId[])).toBeNull(); // the FSM page is never free space
+    expect(await fsm.findFreePageAmong(10, [])).toBeNull();
+  });
 });
